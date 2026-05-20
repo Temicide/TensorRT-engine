@@ -1,5 +1,10 @@
 # Vehicle Metadata Pipeline for Jetson Nano
 
+Note: the production server path has moved to DeepStream. See
+`../../README_DEEPSTREAM_NANO.md` for the RTSP -> nvv4l2decoder -> nvstreammux
+-> nvinfer runtime. The scripts in this folder are kept for model export,
+legacy demos, and vehicle metadata experiments.
+
 This folder contains the files needed to run the vehicle metadata pipeline on Jetson Nano.
 
 Pipeline:
@@ -59,14 +64,18 @@ chmod +x jetson_build_engines_from_onnx.sh
 ./jetson_build_engines_from_onnx.sh
 ```
 
-Expected outputs:
+Expected FP32 outputs:
 
 ```text
-exports/yolo26n_fp16.engine
-exports/efficientnetb0_brand_fp16.engine
+exports/yolo26n_fp32.engine
+exports/efficientnetb0_brand_fp32.engine
 ```
 
-If FP16 fails on your JetPack/TensorRT version, edit `jetson_build_engines_from_onnx.sh`, remove `--fp16`, then rebuild.
+After FP32 works, test FP16 explicitly:
+
+```bash
+USE_FP16=1 YOLO_ENGINE=exports/yolo26n_fp16.engine BRAND_ENGINE=exports/efficientnetb0_brand_fp16.engine ./jetson_build_engines_from_onnx.sh
+```
 
 The runtime supports these brand classifier formats:
 
@@ -85,14 +94,14 @@ exports/efficientnetb0_brand_opset12.onnx
 After building TensorRT, run with the brand engine:
 
 ```bash
---classifier exports/efficientnetb0_brand_fp16.engine
+--classifier exports/efficientnetb0_brand_fp32.engine
 ```
 
 The detector can also use either PyTorch or TensorRT:
 
 ```bash
 --detector yolo26n.pt
---detector exports/yolo26n_fp16.engine
+--detector exports/yolo26n_fp32.engine
 ```
 
 ## Install Runtime Dependencies
@@ -118,8 +127,8 @@ Run headless with browser video link:
 ```bash
 python3 vehicle_metadata_pipeline.py \
   --source "$CAMERA_URL" \
-  --detector exports/yolo26n_fp16.engine \
-  --classifier exports/efficientnetb0_brand_fp16.engine \
+  --detector exports/yolo26n_fp32.engine \
+  --classifier exports/efficientnetb0_brand_fp32.engine \
   --view \
   --print-json \
   --output live_vehicle_metadata.jsonl
@@ -138,8 +147,8 @@ Run with browser link and MP4 recording:
 ```bash
 python3 vehicle_metadata_pipeline.py \
   --source "$CAMERA_URL" \
-  --detector exports/yolo26n_fp16.engine \
-  --classifier exports/efficientnetb0_brand_fp16.engine \
+  --detector exports/yolo26n_fp32.engine \
+  --classifier exports/efficientnetb0_brand_fp32.engine \
   --view \
   --save-video \
   --video-output live_annotated.mp4 \

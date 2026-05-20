@@ -1,0 +1,22 @@
+%YAML:1.0
+
+BaseConfig:
+  minDetectorConfidence: 0.25
+
+TargetManagement:
+  enableBboxUnClipping: 1
+  maxTargetsPerStream: 50
+  minIouDiff4NewTarget: 0.5
+  minTrackerConfidence: 0.2
+
+TrajectoryManagement:
+  useUniqueID: 1
+
+DataAssociator:
+  dataAssociatorType: 0
+  associationMatcherType: 0
+  minMatchingScore4Overall: 0.3
+  minMatchingScore4Iou: 0.3
+
+StateEstimator:
+  stateEstimatorType: 1

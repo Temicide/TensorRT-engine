@@ -8,7 +8,7 @@ Examples:
     python3 convert-onnx-to-engine.py
     python3 convert-onnx-to-engine.py --onnx yolov8n.onnx
     python3 convert-onnx-to-engine.py --onnx yolov8n.onnx --engine yolov8n.engine
-    python3 convert-onnx-to-engine.py --onnx model.onnx --fp32
+    python3 convert-onnx-to-engine.py --onnx model.onnx --fp16
     python3 convert-onnx-to-engine.py --onnx model.onnx --force
     python3 convert-onnx-to-engine.py \
         --onnx dynamic.onnx \
@@ -130,7 +130,7 @@ def validate_dynamic_shape_args(args: argparse.Namespace) -> None:
 
 
 def default_engine_path(onnx_path: Path, fp16: bool) -> Path:
-    suffix = "_fp16.engine" if fp16 else ".engine"
+    suffix = "_fp16.engine" if fp16 else "_fp32.engine"
     return onnx_path.parent / (onnx_path.stem + suffix)
 
 
@@ -249,7 +249,7 @@ def convert_onnx_to_engine(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Convert an ONNX file to a TensorRT .engine file on Jetson Nano."
+        description="Convert an ONNX file to a TensorRT .engine file on Jetson Nano. Defaults to FP32."
     )
     parser.add_argument(
         "--onnx",
@@ -261,12 +261,17 @@ def parse_args() -> argparse.Namespace:
         "--engine",
         "-o",
         default=None,
-        help="Path to output .engine file. Defaults to <onnx_stem>_fp16.engine.",
+        help="Path to output .engine file. Defaults to <onnx_stem>_fp32.engine.",
+    )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Build an FP16 engine. Test only after FP32 works on Jetson Nano.",
     )
     parser.add_argument(
         "--fp32",
         action="store_true",
-        help="Disable FP16 and build an FP32 engine.",
+        help="Compatibility flag; FP32 is already the default.",
     )
     parser.add_argument(
         "--workspace",
@@ -312,7 +317,11 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
-    fp16 = not args.fp32
+    if args.fp16 and args.fp32:
+        print("[ERROR] Use either --fp16 or --fp32, not both.", file=sys.stderr)
+        return 1
+
+    fp16 = bool(args.fp16)
     onnx_path = Path(args.onnx).expanduser() if args.onnx else prompt_for_onnx_path()
     engine_path = (
         Path(args.engine).expanduser()

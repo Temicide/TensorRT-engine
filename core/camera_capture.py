@@ -9,6 +9,9 @@ from core.state import latest_frame_state
 
 log = logging.getLogger("multicam")
 
+# Legacy OpenCV capture path. The production server no longer imports this
+# module; RTSP ingest is handled by DeepStream rtspsrc/nvv4l2decoder.
+
 # ─────────────────────────── Pipeline loop per camera ─────────────────────────
 CAPTURE_OPEN_LOCK = threading.Lock()
 

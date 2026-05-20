@@ -17,6 +17,9 @@ else:
 
 log = logging.getLogger("multicam")
 
+# Legacy manual TensorRT path. The production server now uses DeepStream nvinfer
+# and does not import or execute this wrapper.
+
 # ─────────────────────────── TensorRT model (Jetson GPU) ─────────────────────
 class HostDeviceMem:
     """Pair of page-locked CPU memory and GPU device memory for one binding."""

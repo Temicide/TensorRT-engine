@@ -1,0 +1,37 @@
+# Primary GIE template for Jetson Nano + DeepStream 6.0/6.0.1.
+# server.py generates an equivalent runtime config from config.py before
+# starting nvinfer. Keep this file as the editable DeepStream reference.
+#
+# Engine portability rule:
+# - Prefer onnx-file and let nvinfer build model-engine-file on the Jetson Nano.
+# - Only keep model-engine-file if it was generated on this exact Nano with the
+#   same JetPack, TensorRT, CUDA, DeepStream, precision, input shape, and batch.
+
+[property]
+gpu-id=0
+onnx-file=models/pipeline_1/exports/yolo26n_opset12.onnx
+model-engine-file=models/pipeline_1/exports/yolo26n_deepstream_nano_b1_fp32.engine
+labelfile-path=configs/deepstream/labels_coco.txt
+batch-size=1
+network-mode=0
+num-detected-classes=80
+process-mode=1
+network-type=0
+gie-unique-id=1
+interval=0
+workspace-size=1024
+cluster-mode=2
+maintain-aspect-ratio=1
+symmetric-padding=1
+infer-dims=3;640;640
+net-scale-factor=0.0039215697906911373
+model-color-format=0
+parse-bbox-func-name=NvDsInferParseYolo
+custom-lib-path=/opt/nvidia/deepstream/deepstream-6.0/sources/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
+engine-create-func-name=NvDsInferYoloCudaEngineGet
+output-blob-names=output0
+
+[class-attrs-all]
+pre-cluster-threshold=0.25
+nms-iou-threshold=0.45
+topk=300

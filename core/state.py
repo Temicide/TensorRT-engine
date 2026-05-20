@@ -17,10 +17,9 @@ cam_state = {
     for cid in cam_ids
 }
 
-# Latest raw frames from camera threads.
-# Camera threads only read RTSP frames and never touch CUDA/TensorRT.
-# A single inference worker owns TensorRT calls. This is much more stable
-# on Jetson Nano than calling one shared CUDA context from 5 camera threads.
+# Legacy raw-frame state used by the old OpenCV/TensorRT path. The DeepStream
+# server path does not populate this; DeepStream metadata updates cam_state and
+# detection_log directly from the pad probe.
 latest_frame_state = {
     cid: {
         "frame": None,

@@ -1,0 +1,14 @@
+# Optional nvtracker settings for Jetson Nano. Keep tracker disabled until
+# detection boxes, labels, and parser behavior have been validated.
+#
+# If enabled in config.py, core.deepstream_pipeline reads this key/value file
+# and sets matching nvtracker element properties.
+
+tracker-width=480
+tracker-height=272
+gpu-id=0
+ll-lib-file=/opt/nvidia/deepstream/deepstream-6.0/lib/libnvds_nvmultiobjecttracker.so
+ll-config-file=configs/deepstream/tracker_iou_config.yml
+enable-batch-process=1
+enable-past-frame=0
+display-tracking-id=1
