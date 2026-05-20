@@ -39,6 +39,8 @@ CONFIG = {
     "iou_threshold":  0.45,
     "imgsz":          224,
     "mjpeg_fps":      20,
+    "use_gstreamer":  True,
+    "rtsp_latency_ms": 100,
     "host":           "0.0.0.0",
     "port":           8080,
     "jetson_id":      "jetson-nano-01",
@@ -602,18 +604,51 @@ def broadcast_sse(cam_id: str, record: dict):
 
 
 # ─────────────────────────── Pipeline loop per camera ─────────────────────────
+def gst_rtsp_pipelines(source: str):
+    latency = int(CONFIG.get("rtsp_latency_ms", 100))
+    appsink = "appsink drop=1 max-buffers=1 sync=false"
+
+    # JetPack 4/5/6 preferred path. nvv4l2decoder uses Jetson HW decode.
+    yield (
+        "nvv4l2decoder",
+        f"rtspsrc location={source} latency={latency} protocols=tcp ! "
+        "rtph264depay ! h264parse ! nvv4l2decoder enable-max-performance=1 ! "
+        "nvvidconv ! video/x-raw,format=BGRx ! videoconvert ! "
+        f"video/x-raw,format=BGR ! {appsink}",
+    )
+
+    # Older JetPack fallback.
+    yield (
+        "omxh264dec",
+        f"rtspsrc location={source} latency={latency} protocols=tcp ! "
+        "rtph264depay ! h264parse ! omxh264dec ! nvvidconv ! "
+        "video/x-raw,format=BGRx ! videoconvert ! "
+        f"video/x-raw,format=BGR ! {appsink}",
+    )
+
+    # CPU decode fallback through GStreamer. Still useful when OpenCV's direct
+    # RTSP backend is unreliable, but it will not reduce CPU load.
+    yield (
+        "avdec_h264",
+        f"rtspsrc location={source} latency={latency} protocols=tcp ! "
+        "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
+        f"video/x-raw,format=BGR ! {appsink}",
+    )
+
+
 def open_capture(cam_id: str, source: str) -> cv2.VideoCapture:
-    """Try GStreamer HW decode first, fall back to SW decode."""
-    if source.startswith("rtsp://"):
-        gst = (f"rtspsrc location={source} latency=100 ! "
-               "rtph264depay ! h264parse ! omxh264dec ! nvvidconv ! "
-               "video/x-raw,format=BGRx ! videoconvert ! "
-               "video/x-raw,format=BGR ! appsink drop=1")
-        cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-        if cap.isOpened():
-            log.info(f"[{cam_id}] GStreamer HW decode OK")
-            return cap
-        log.warning(f"[{cam_id}] GStreamer failed, falling back to SW decode")
+    """Try GStreamer first, then fall back to OpenCV's default RTSP backend."""
+    if CONFIG.get("use_gstreamer", True) and source.startswith("rtsp://"):
+        for name, gst in gst_rtsp_pipelines(source):
+            cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                log.info(f"[{cam_id}] GStreamer opened with {name}")
+                return cap
+            cap.release()
+            log.warning(f"[{cam_id}] GStreamer pipeline failed: {name}")
+
+        log.warning(f"[{cam_id}] All GStreamer pipelines failed, falling back to OpenCV RTSP")
+
     cap = cv2.VideoCapture(source)
     return cap
 
