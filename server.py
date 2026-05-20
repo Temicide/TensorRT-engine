@@ -42,7 +42,7 @@ CONFIG = {
     "use_gstreamer":  True,
     "rtsp_latency_ms": 100,
     "host":           "0.0.0.0",
-    "port":           8080,
+    "port":           8081,
     "jetson_id":      "jetson-nano-01",
     "device_name":    "jetson-nano-01",
     "external_api":   "http://10.0.11.153:8080/api/v1/raw_data",
