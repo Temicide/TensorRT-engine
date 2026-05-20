@@ -23,7 +23,7 @@ import uuid
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -73,7 +73,7 @@ log = logging.getLogger("multicam")
 # ──────────────────────────── Shared state per camera ─────────────────────────
 cam_ids = list(CONFIG["cameras"].keys())
 
-cam_state: dict[str, dict] = {
+cam_state: Dict[str, dict] = {
     cid: {
         "frame_jpg": b"",
         "detections": [],
@@ -86,13 +86,13 @@ cam_state: dict[str, dict] = {
 }
 
 # Central detection log (all cameras)
-detection_log: list[dict] = []
+detection_log: List[dict] = []
 detection_log_lock = threading.Lock()
 MAX_LOG = 5000
 
 # SSE queues: per-camera subscribers + global subscribers
-global_sse_subscribers: list[asyncio.Queue] = []
-per_cam_sse_subscribers: dict[str, list[asyncio.Queue]] = {cid: [] for cid in cam_ids}
+global_sse_subscribers: List[asyncio.Queue] = []
+per_cam_sse_subscribers: Dict[str, List[asyncio.Queue]] = {cid: [] for cid in cam_ids}
 sse_sub_lock = threading.Lock()
 
 # ───────────────────────── TensorRT model (shared, thread-safe) ───────────────
@@ -159,7 +159,7 @@ class YOLOModel:
             output_desc,
         )
 
-    def _inspect_bindings(self) -> list[dict]:
+    def _inspect_bindings(self) -> List[dict]:
         bindings = []
         if self.uses_tensor_api:
             for i in range(self.engine.num_io_tensors):
@@ -183,7 +183,7 @@ class YOLOModel:
                 })
         return bindings
 
-    def _resolve_input_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+    def _resolve_input_shape(self, shape: Tuple[int, ...]) -> Tuple[int, ...]:
         if len(shape) != 4:
             raise RuntimeError(f"Expected 4D YOLO input, got {shape}")
 
@@ -212,7 +212,7 @@ class YOLOModel:
 
         return tuple(resolved)
 
-    def _set_input_shape(self, name: str, shape: tuple[int, ...]) -> None:
+    def _set_input_shape(self, name: str, shape: Tuple[int, ...]) -> None:
         if self.uses_tensor_api and hasattr(self.context, "set_input_shape"):
             if not self.context.set_input_shape(name, shape):
                 raise RuntimeError(f"TensorRT rejected input shape {shape} for {name}")
@@ -234,7 +234,7 @@ class YOLOModel:
             raise RuntimeError(f"Unsupported YOLO input shape: {shape}")
         self.imgsz = self.input_h if self.input_h == self.input_w else (self.input_h, self.input_w)
 
-    def _binding_runtime_shape(self, binding: dict) -> tuple[int, ...]:
+    def _binding_runtime_shape(self, binding: dict) -> Tuple[int, ...]:
         if self.uses_tensor_api and hasattr(self.context, "get_tensor_shape"):
             shape = tuple(self.context.get_tensor_shape(binding["name"]))
         elif hasattr(self.context, "get_binding_shape"):
@@ -265,7 +265,7 @@ class YOLOModel:
             if self.uses_tensor_api and hasattr(self.context, "set_tensor_address"):
                 self.context.set_tensor_address(binding["name"], int(device))
 
-    def _preprocess(self, bgr_frame: np.ndarray) -> tuple[np.ndarray, float, tuple[int, int]]:
+    def _preprocess(self, bgr_frame: np.ndarray) -> Tuple[np.ndarray, float, Tuple[int, int]]:
         h0, w0 = bgr_frame.shape[:2]
         scale = min(self.input_w / w0, self.input_h / h0)
         new_w = max(1, int(round(w0 * scale)))
@@ -290,7 +290,7 @@ class YOLOModel:
             tensor = tensor[np.newaxis]
         return np.ascontiguousarray(tensor), scale, (pad_x, pad_y)
 
-    def infer(self, bgr_frame: np.ndarray) -> list[dict]:
+    def infer(self, bgr_frame: np.ndarray) -> List[dict]:
         h0, w0 = bgr_frame.shape[:2]
         inp, scale, pad = self._preprocess(bgr_frame)
 
@@ -332,12 +332,12 @@ class YOLOModel:
 
     def _postprocess(
         self,
-        outputs: list[np.ndarray],
+        outputs: List[np.ndarray],
         orig_h: int,
         orig_w: int,
         scale: float,
-        pad: tuple[int, int],
-    ) -> list[dict]:
+        pad: Tuple[int, int],
+    ) -> List[dict]:
         multi_output = self._postprocess_multi_output_nms(outputs, orig_h, orig_w, scale, pad)
         if multi_output is not None:
             return multi_output
@@ -403,12 +403,12 @@ class YOLOModel:
 
     def _postprocess_multi_output_nms(
         self,
-        outputs: list[np.ndarray],
+        outputs: List[np.ndarray],
         orig_h: int,
         orig_w: int,
         scale: float,
-        pad: tuple[int, int],
-    ) -> Optional[list[dict]]:
+        pad: Tuple[int, int],
+    ) -> Optional[List[dict]]:
         if len(outputs) < 4:
             return None
 
@@ -501,7 +501,7 @@ def scale_boxes_from_engine(
     orig_w: int,
     orig_h: int,
     scale: float,
-    pad: tuple[int, int],
+    pad: Tuple[int, int],
 ) -> np.ndarray:
     pad_x, pad_y = pad
     boxes = boxes.astype(np.float32, copy=True)
@@ -535,7 +535,7 @@ def cpu_nms(boxes, scores, iou_thresh):
 COLORS = [(0,255,0),(255,100,0),(0,100,255),(255,255,0),(0,255,255),
           (255,0,255),(128,255,0),(0,128,255),(255,128,0),(128,0,255)]
 
-def draw_frame(frame: np.ndarray, detections: list[dict], fps: float, cam_id: str) -> np.ndarray:
+def draw_frame(frame: np.ndarray, detections: List[dict], fps: float, cam_id: str) -> np.ndarray:
     img = frame.copy()
     for d in detections:
         x1,y1,x2,y2 = [int(v) for v in d["bbox_xyxy"]]
