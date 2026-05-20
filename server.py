@@ -15,7 +15,6 @@ Endpoints:
 """
 
 import json
-import uuid
 import asyncio
 import os
 import threading
@@ -27,7 +26,7 @@ from typing import Optional
 from static.templates import cam_live_html, log_live_html
 from core.tensorrt_engine import YOLOModel
 from routers.api_exporter import push_external_async
-from utils.utils import draw_frame, COLORS, COCO_NAMES
+from utils.utils import draw_frame
 from config import CONFIG
 
 # Make OpenCV/FFmpeg RTSP capture more stable on Jetson Nano.
@@ -43,22 +42,11 @@ try:
 except Exception:
     pass
 
-# TensorRT inference on Jetson GPU
-# Required on Jetson: python3-libnvinfer + pycuda
-try:
-    import tensorrt as trt
-    import pycuda.driver as cuda
-    # Do NOT use pycuda.autoinit in this multi-threaded server.
-    # We create and push/pop the CUDA context explicitly.
-except Exception as e:
-    trt = None
-    cuda = None
-    TRT_IMPORT_ERROR = e
-else:
-    TRT_IMPORT_ERROR = None
 from fastapi import FastAPI, Query, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
 import uvicorn
+
+log = logging.getLogger("multicam")
 
 # ──────────────────────────── Shared state per camera ─────────────────────────
 cam_ids = CONFIG.get("active_cameras") or list(CONFIG["cameras"].keys())
