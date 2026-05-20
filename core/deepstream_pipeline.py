@@ -47,7 +47,8 @@ def _load_deepstream_modules():
     except Exception as exc:
         raise DeepStreamImportError(
             "Could not import pyds. Build/install DeepStream Python bindings "
-            "for the JetPack 4.6.x / DeepStream 6.0.x environment on Nano."
+            "for the JetPack 4.6.x / DeepStream 6.0.x environment on Nano. "
+            "See README_DEEPSTREAM_NANO.md#install-deepstream-python-bindings-pyds."
         ) from exc
 
     return GLib, Gst, pyds

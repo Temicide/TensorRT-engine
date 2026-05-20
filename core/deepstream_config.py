@@ -7,6 +7,15 @@ from config import CONFIG
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RUNTIME_GIE_CONFIG = Path("/tmp/tensorrt_engine_primary_gie_yolov8n_nano.txt")
+POSTPROCESS_OP_TOKENS = {
+    b"\x22\x0aBatchedNMS": "BatchedNMS",
+    b"\x22\x0eBatchedNMS_TRT": "BatchedNMS_TRT",
+    b"\x22\x0cEfficientNMS": "EfficientNMS",
+    b"\x22\x10EfficientNMS_TRT": "EfficientNMS_TRT",
+    b"\x22\x03Mod": "Mod",
+    b"\x22\x11NonMaxSuppression": "NonMaxSuppression",
+    b"\x22\x04TopK": "TopK",
+}
 
 
 class DeepStreamConfigError(RuntimeError):
@@ -57,6 +66,15 @@ def load_labels(labels_path: str) -> List[str]:
     ]
 
 
+def _detect_onnx_postprocess_ops(onnx_path: Path) -> List[str]:
+    data = onnx_path.read_bytes()
+    return sorted(
+        op_name
+        for token, op_name in POSTPROCESS_OP_TOKENS.items()
+        if token in data
+    )
+
+
 def validate_deepstream_inputs(ds: Dict[str, object]) -> None:
     onnx_path = Path(resolve_project_path(str(ds.get("onnx_model_path") or "")))
     labels_path = Path(resolve_project_path(str(ds.get("labels_path") or "")))
@@ -77,6 +95,18 @@ def validate_deepstream_inputs(ds: Dict[str, object]) -> None:
             f"  - {details}\n"
             "Build/copy these on the Jetson Nano. Do not copy a TensorRT "
             ".engine from Orin, desktop GPU, Colab, or another JetPack stack."
+        )
+
+    postprocess_ops = _detect_onnx_postprocess_ops(onnx_path)
+    if postprocess_ops:
+        ops = ", ".join(postprocess_ops)
+        raise DeepStreamConfigError(
+            "DeepStream ONNX is not a raw YOLO detector export. "
+            f"Found post-processing operators in {onnx_path}: {ops}.\n"
+            "Jetson Nano / TensorRT 8 / DeepStream-YOLO expects raw detection "
+            "head output and lets the custom parser perform decode/NMS. "
+            "Regenerate the ONNX with models/pipeline_1/export_yolo_onnx.py "
+            "without --nms, delete the stale .engine file, then start server.py again."
         )
 
 

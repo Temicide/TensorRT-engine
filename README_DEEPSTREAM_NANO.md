@@ -75,6 +75,49 @@ python3 -c "import tensorrt as trt; print(trt.__version__)"
 
 For a standard Nano setup, expect JetPack 4.6.x and DeepStream 6.0/6.0.1.
 
+## Install DeepStream Python Bindings (`pyds`)
+
+This server imports `pyds` to read DeepStream metadata from Python. `pyds` is
+not provided by this repository; install the wheel that matches the DeepStream
+SDK on the Nano.
+
+Check the installed DeepStream release first:
+
+```bash
+deepstream-app --version-all
+python3 --version
+uname -m
+```
+
+For DeepStream 6.0 on Jetson Nano / aarch64:
+
+```bash
+python3 -m pip install --user \
+  https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.1.0/pyds-1.1.0-py3-none-linux_aarch64.whl
+```
+
+For DeepStream 6.0.1 on Jetson Nano / aarch64:
+
+```bash
+python3 -m pip install --user \
+  https://github.com/NVIDIA-AI-IOT/deepstream_python_apps/releases/download/v1.1.1/pyds-1.1.1-py3-none-linux_aarch64.whl
+```
+
+Verify the import with the same Python environment used for `server.py`:
+
+```bash
+python3 -c "import pyds; print('pyds OK')"
+```
+
+If you run the server from a virtualenv, create it with system site packages so
+Jetson/DeepStream Python modules remain visible:
+
+```bash
+python3 -m venv --system-site-packages .venv
+. .venv/bin/activate
+python3 -c "import gi, pyds; print('DeepStream Python imports OK')"
+```
+
 ## Export YOLO ONNX
 
 Preferred portable flow:
@@ -83,7 +126,7 @@ Preferred portable flow:
 YOLO .pt -> ONNX -> copy ONNX to Jetson Nano -> nvinfer builds .engine
 ```
 
-The repository already contains:
+The configured DeepStream detector path is:
 
 ```text
 models/pipeline_1/exports/yolo26n_opset12.onnx
@@ -93,8 +136,18 @@ To re-export:
 
 ```bash
 cd models/pipeline_1
-python3 export_yolo_onnx.py --weights yolo26n.pt --imgsz 640 --opset 12
+python3 export_yolo_onnx.py \
+  --weights yolo26n.pt \
+  --imgsz 640 \
+  --opset 12 \
+  --output exports/yolo26n_opset12.onnx
 ```
+
+Do not pass `--nms` for the DeepStream server. The DeepStream-YOLO parser
+expects raw detector output and performs bbox decode/NMS itself. If TensorRT
+logs an error around `TopK`, `Mod`, `NonMaxSuppression`, or "Plugin not found",
+the ONNX was exported with post-processing included; regenerate it with the
+command above and delete the stale engine before retrying.
 
 If 640 is too slow on Nano, export 416 or 320 and update
 `CONFIG["deepstream"]["input_width"]` / `input_height` plus the nvinfer config.

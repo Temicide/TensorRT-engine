@@ -6,6 +6,8 @@
 # - Prefer onnx-file and let nvinfer build model-engine-file on the Jetson Nano.
 # - Only keep model-engine-file if it was generated on this exact Nano with the
 #   same JetPack, TensorRT, CUDA, DeepStream, precision, input shape, and batch.
+# - Export raw YOLO outputs for DeepStream. Do not use an ONNX with NMS/TopK/Mod
+#   post-processing baked into the graph.
 
 [property]
 gpu-id=0

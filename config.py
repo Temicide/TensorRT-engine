@@ -7,7 +7,7 @@ CONFIG = {
 
     # Portable model artifact. Let DeepStream/TensorRT build the engine on the
     # Jetson Nano unless the .engine was generated on this exact Nano stack.
-    "model_path":     "models/pipeline_beta/yolov8n.onnx",
+    "model_path":     "models/pipeline_beta/yolov8n(1).onnx",
     "conf_threshold": 0.25,
     "iou_threshold":  0.45,
     "imgsz":          640,
@@ -44,8 +44,10 @@ CONFIG = {
         "drop_on_latency": True,
         "reconnect_sec": 5,
 
-        "onnx_model_path": "models/pipeline_1/exports/yolo26n_opset12.onnx",
-        "engine_path": "models/pipeline_1/exports/yolo26n_deepstream_nano_b1_fp32.engine",
+        # Must be a raw YOLO detector export. Do not use an ONNX with NMS,
+        # TopK, or Mod post-processing baked into the graph.
+        "onnx_model_path": "models/pipeline_beta/yolov8n(1).onnx",
+        "engine_path": "models/pipeline_beta/yolov8n_deepstream_nano_b1_fp32.engine",
         "labels_path": "configs/deepstream/labels_coco.txt",
         "custom_parser_path": "/opt/nvidia/deepstream/deepstream-6.0/sources/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so",
         "primary_gie_config_path": "configs/deepstream/primary_gie_yolov8n_nano.txt",

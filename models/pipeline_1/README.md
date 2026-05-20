@@ -55,6 +55,15 @@ export_brand_onnx.py
 export_yolo_onnx.py
 ```
 
+For the DeepStream server, export the detector ONNX without NMS/post-processing:
+
+```bash
+python3 export_yolo_onnx.py --weights yolo26n.pt --imgsz 640 --opset 12
+```
+
+The exporter saves `exports/yolo26n_opset12.onnx` by default and rejects graphs
+that still contain `TopK`, `Mod`, or `NonMaxSuppression`.
+
 ## Build TensorRT Engines On Jetson
 
 Build `.engine` files on the Jetson Nano itself. Do not build `.engine` on Windows and copy it to Jetson.
