@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Multi-Camera YOLO TensorRT Jetson Pipeline
-5 RTSP streams -> single YOLO model -> per-camera MJPEG + SSE + log
+Multi-Camera YOLO TensorRT Jetson Pipeline - safe capture
+5 RTSP streams -> TensorRT YOLO engine -> per-camera MJPEG + SSE + log
 All detection logs POST to: http://10.0.11.153:8080/api/v1/raw_data
 
 Endpoints:
@@ -21,12 +21,36 @@ import logging
 import collections
 import uuid
 import asyncio
+import os
 from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
+
+# Make OpenCV/FFmpeg RTSP capture more stable on Jetson Nano.
+# These options must be set before cv2 opens any VideoCapture.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000|max_delay;500000")
 
 import cv2
 import numpy as np
+
+# Avoid OpenCV spawning many internal CPU threads on Jetson Nano.
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+
+# TensorRT inference on Jetson GPU
+# Required on Jetson: python3-libnvinfer + pycuda
+try:
+    import tensorrt as trt
+    import pycuda.driver as cuda
+    # Do NOT use pycuda.autoinit in this multi-threaded server.
+    # We create and push/pop the CUDA context explicitly.
+except Exception as e:
+    trt = None
+    cuda = None
+    TRT_IMPORT_ERROR = e
+else:
+    TRT_IMPORT_ERROR = None
 import requests
 from fastapi import FastAPI, Query, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
@@ -34,18 +58,30 @@ import uvicorn
 
 # ─────────────────────────── CONFIG (edit only here) ──────────────────────────
 CONFIG = {
-    "model_path":     "yolov8n_fp16.engine",
+    # TensorRT engine built for this exact Jetson / TensorRT / CUDA version.
+    # Example: /usr/src/tensorrt/bin/trtexec --onnx=yolov8n.onnx --saveEngine=yolov8n.engine --fp16
+    "model_path":     "yolov8n.engine",
     "conf_threshold": 0.25,
     "iou_threshold":  0.45,
     "imgsz":          224,
     "mjpeg_fps":      20,
-    "use_gstreamer":  True,
-    "rtsp_latency_ms": 100,
     "host":           "0.0.0.0",
-    "port":           8081,
+    "port":           8000,
     "jetson_id":      "jetson-nano-01",
     "device_name":    "jetson-nano-01",
     "external_api":   "http://10.0.11.153:8080/api/v1/raw_data",
+
+    # TensorRT engine inference is GPU-only. If TensorRT/PyCUDA cannot load, startup stops.
+    "gpu_required":   True,
+
+    # Capture stability controls for Jetson Nano.
+    # If GStreamer probing crashes or fails, keep this False and use OpenCV/FFmpeg TCP.
+    "enable_gstreamer": False,
+    # Start capture threads one by one, not all at the same millisecond.
+    "capture_startup_stagger_sec": 1.5,
+    # For debugging, set to ["cam1"] first. Use None to enable all cameras.
+    "active_cameras": None,
+
     "cameras": {
         "cam1": "rtsp://10.0.11.153:8554/mock1",
         "cam2": "rtsp://10.0.11.153:8554/mock5",
@@ -73,9 +109,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("multicam")
 
 # ──────────────────────────── Shared state per camera ─────────────────────────
-cam_ids = list(CONFIG["cameras"].keys())
+cam_ids = CONFIG.get("active_cameras") or list(CONFIG["cameras"].keys())
 
-cam_state: Dict[str, dict] = {
+cam_state = {
     cid: {
         "frame_jpg": b"",
         "detections": [],
@@ -87,296 +123,339 @@ cam_state: Dict[str, dict] = {
     for cid in cam_ids
 }
 
+# Latest raw frames from camera threads.
+# Camera threads only read RTSP frames and never touch CUDA/TensorRT.
+# A single inference worker owns TensorRT calls. This is much more stable
+# on Jetson Nano than calling one shared CUDA context from 5 camera threads.
+latest_frame_state = {
+    cid: {
+        "frame": None,
+        "frame_count": 0,
+        "updated_at": 0.0,
+        "lock": threading.Lock(),
+    }
+    for cid in cam_ids
+}
+
 # Central detection log (all cameras)
-detection_log: List[dict] = []
+detection_log = []
 detection_log_lock = threading.Lock()
 MAX_LOG = 5000
 
 # SSE queues: per-camera subscribers + global subscribers
-global_sse_subscribers: List[asyncio.Queue] = []
-per_cam_sse_subscribers: Dict[str, List[asyncio.Queue]] = {cid: [] for cid in cam_ids}
+global_sse_subscribers = []
+per_cam_sse_subscribers = {cid: [] for cid in cam_ids}
 sse_sub_lock = threading.Lock()
 
-# ───────────────────────── TensorRT model (shared, thread-safe) ───────────────
+# ─────────────────────────── TensorRT model (Jetson GPU) ─────────────────────
+class HostDeviceMem:
+    """Pair of page-locked CPU memory and GPU device memory for one binding."""
+    def __init__(self, host_mem, device_mem):
+        self.host = host_mem
+        self.device = device_mem
+
+
 class YOLOModel:
+    """
+    TensorRT YOLO inference wrapper for a pre-built .engine file.
+
+    Important:
+      - The .engine must be built on the same Jetson / TensorRT / CUDA stack.
+      - This class does NOT use ONNX Runtime.
+      - Inference runs on the Jetson GPU through TensorRT.
+      - Preprocessing, NMS, drawing, and JPEG encoding are still CPU-side.
+    """
     def __init__(self, model_path: str):
-        model_file = Path(model_path)
-        if not model_file.is_absolute():
-            model_file = Path(__file__).resolve().parent / model_file
-        if not model_file.exists():
-            raise FileNotFoundError(f"TensorRT engine not found: {model_file}")
-
-        try:
-            import tensorrt as trt
-            import pycuda.driver as cuda
-        except ImportError as exc:
+        if TRT_IMPORT_ERROR is not None or trt is None or cuda is None:
             raise RuntimeError(
-                "TensorRT engine inference requires Python packages 'tensorrt' "
-                "and 'pycuda' on the Jetson runtime."
-            ) from exc
-
-        self.trt = trt
-        self.cuda = cuda
-        self.lock = threading.Lock()
-        self.trt_logger = trt.Logger(trt.Logger.WARNING)
-
-        cuda.init()
-        self.cuda_context = cuda.Device(0).make_context()
-        try:
-            runtime = trt.Runtime(self.trt_logger)
-            with model_file.open("rb") as f:
-                self.engine = runtime.deserialize_cuda_engine(f.read())
-            if self.engine is None:
-                raise RuntimeError(f"Failed to deserialize TensorRT engine: {model_file}")
-
-            self.context = self.engine.create_execution_context()
-            self.uses_tensor_api = hasattr(self.engine, "num_io_tensors")
-            self.bindings = self._inspect_bindings()
-
-            inputs = [b for b in self.bindings if b["is_input"]]
-            if len(inputs) != 1:
-                raise RuntimeError(f"Expected one engine input, found {len(inputs)}")
-            self.input_binding = inputs[0]
-            self.output_bindings = [b for b in self.bindings if not b["is_input"]]
-            if not self.output_bindings:
-                raise RuntimeError("TensorRT engine has no output bindings")
-
-            self.input_shape = self._resolve_input_shape(self.input_binding["shape"])
-            self._set_input_shape(self.input_binding["name"], self.input_shape)
-            self._derive_input_layout()
-            self._allocate_buffers()
-        finally:
-            self.cuda_context.pop()
-
-        output_desc = ", ".join(
-            f"{b['name']}:{tuple(b['shape'])}/{np.dtype(b['dtype']).name}"
-            for b in self.output_bindings
-        )
-        log.info(
-            "TensorRT engine loaded: %s | input=%s:%s/%s | outputs=%s",
-            model_path,
-            self.input_binding["name"],
-            self.input_shape,
-            np.dtype(self.input_binding["dtype"]).name,
-            output_desc,
-        )
-
-    def _inspect_bindings(self) -> List[dict]:
-        bindings = []
-        if self.uses_tensor_api:
-            for i in range(self.engine.num_io_tensors):
-                name = self.engine.get_tensor_name(i)
-                mode = self.engine.get_tensor_mode(name)
-                bindings.append({
-                    "index": i,
-                    "name": name,
-                    "is_input": mode == self.trt.TensorIOMode.INPUT,
-                    "shape": tuple(self.engine.get_tensor_shape(name)),
-                    "dtype": np.dtype(self.trt.nptype(self.engine.get_tensor_dtype(name))),
-                })
-        else:
-            for i in range(self.engine.num_bindings):
-                bindings.append({
-                    "index": i,
-                    "name": self.engine.get_binding_name(i),
-                    "is_input": self.engine.binding_is_input(i),
-                    "shape": tuple(self.engine.get_binding_shape(i)),
-                    "dtype": np.dtype(self.trt.nptype(self.engine.get_binding_dtype(i))),
-                })
-        return bindings
-
-    def _resolve_input_shape(self, shape: Tuple[int, ...]) -> Tuple[int, ...]:
-        if len(shape) != 4:
-            raise RuntimeError(f"Expected 4D YOLO input, got {shape}")
-
-        resolved = [int(d) for d in shape]
-        if resolved[0] < 0:
-            resolved[0] = 1
-
-        # Prefer the engine's static dimensions. CONFIG["imgsz"] only fills
-        # dynamic dimensions when the engine was built with an optimization profile.
-        if resolved[1] == 3 or resolved[1] < 0:
-            if resolved[1] < 0:
-                resolved[1] = 3
-            if resolved[2] < 0:
-                resolved[2] = int(CONFIG["imgsz"])
-            if resolved[3] < 0:
-                resolved[3] = int(CONFIG["imgsz"])
-        elif resolved[3] == 3 or resolved[3] < 0:
-            if resolved[1] < 0:
-                resolved[1] = int(CONFIG["imgsz"])
-            if resolved[2] < 0:
-                resolved[2] = int(CONFIG["imgsz"])
-            if resolved[3] < 0:
-                resolved[3] = 3
-        else:
-            raise RuntimeError(f"Cannot infer YOLO input layout from shape {shape}")
-
-        return tuple(resolved)
-
-    def _set_input_shape(self, name: str, shape: Tuple[int, ...]) -> None:
-        if self.uses_tensor_api and hasattr(self.context, "set_input_shape"):
-            if not self.context.set_input_shape(name, shape):
-                raise RuntimeError(f"TensorRT rejected input shape {shape} for {name}")
-        elif any(d < 0 for d in self.input_binding["shape"]):
-            if not self.context.set_binding_shape(self.input_binding["index"], shape):
-                raise RuntimeError(f"TensorRT rejected input shape {shape} for {name}")
-
-    def _derive_input_layout(self) -> None:
-        shape = self.input_shape
-        if shape[1] == 3:
-            self.input_layout = "NCHW"
-            self.input_h = int(shape[2])
-            self.input_w = int(shape[3])
-        elif shape[3] == 3:
-            self.input_layout = "NHWC"
-            self.input_h = int(shape[1])
-            self.input_w = int(shape[2])
-        else:
-            raise RuntimeError(f"Unsupported YOLO input shape: {shape}")
-        self.imgsz = self.input_h if self.input_h == self.input_w else (self.input_h, self.input_w)
-
-    def _binding_runtime_shape(self, binding: dict) -> Tuple[int, ...]:
-        if self.uses_tensor_api and hasattr(self.context, "get_tensor_shape"):
-            shape = tuple(self.context.get_tensor_shape(binding["name"]))
-        elif hasattr(self.context, "get_binding_shape"):
-            shape = tuple(self.context.get_binding_shape(binding["index"]))
-        else:
-            shape = binding["shape"]
-
-        if any(int(d) < 0 for d in shape):
-            raise RuntimeError(
-                f"Dynamic shape for binding {binding['name']} was not resolved: {shape}"
+                "TensorRT/PyCUDA import failed. This server now requires TensorRT GPU inference.\n"
+                f"Import error: {TRT_IMPORT_ERROR}\n\n"
+                "Try checking these on Jetson:\n"
+                "  python -c 'import tensorrt as trt; print(trt.__version__)'\n"
+                "  python -c 'import pycuda.driver as cuda; print(\"pycuda ok\")'\n"
+                "If TensorRT works in system Python but not venv, create the venv with:\n"
+                "  python3 -m venv --system-site-packages venv\n"
             )
-        return tuple(int(d) for d in shape)
 
-    def _allocate_buffers(self) -> None:
-        self.stream = self.cuda.Stream()
-        self.binding_ptrs = [0] * len(self.bindings)
+        self.model_path = model_path
+        self.logger = trt.Logger(trt.Logger.WARNING)
+        self.lock = threading.Lock()
 
-        for binding in self.bindings:
-            shape = self._binding_runtime_shape(binding)
-            binding["shape"] = shape
-            size = int(np.prod(shape))
-            host = self.cuda.pagelocked_empty(size, binding["dtype"])
-            device = self.cuda.mem_alloc(host.nbytes)
-            binding["host"] = host
-            binding["device"] = device
-            self.binding_ptrs[binding["index"]] = int(device)
+        # PyCUDA contexts are thread-local. This server runs inference from
+        # camera threads, so create one explicit CUDA context and push/pop it
+        # around every TensorRT call. This avoids crashes such as:
+        #   free(): double free detected in tcache 2
+        cuda.init()
+        self.cuda_device = cuda.Device(0)
+        self.cuda_ctx = self.cuda_device.make_context()
+        self.stream = cuda.Stream()
 
-            if self.uses_tensor_api and hasattr(self.context, "set_tensor_address"):
-                self.context.set_tensor_address(binding["name"], int(device))
+        log.info("Created explicit CUDA context on device 0")
+        log.info(f"Loading TensorRT engine: {model_path}")
+        with open(model_path, "rb") as f, trt.Runtime(self.logger) as runtime:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
 
-    def _preprocess(self, bgr_frame: np.ndarray) -> Tuple[np.ndarray, float, Tuple[int, int]]:
-        h0, w0 = bgr_frame.shape[:2]
-        scale = min(self.input_w / w0, self.input_h / h0)
-        new_w = max(1, int(round(w0 * scale)))
-        new_h = max(1, int(round(h0 * scale)))
-        pad_x = (self.input_w - new_w) // 2
-        pad_y = (self.input_h - new_h) // 2
+        if self.engine is None:
+            raise RuntimeError(
+                f"Failed to deserialize TensorRT engine: {model_path}. "
+                "The .engine may have been built for a different Jetson/TensorRT/CUDA version."
+            )
 
-        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        canvas = np.full((self.input_h, self.input_w, 3), 114, dtype=np.uint8)
-        canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+        self.context = self.engine.create_execution_context()
+        if self.context is None:
+            raise RuntimeError("Failed to create TensorRT execution context.")
 
-        if np.issubdtype(self.input_binding["dtype"], np.floating):
-            tensor = canvas.astype(np.float32) / 255.0
-            tensor = tensor.astype(self.input_binding["dtype"], copy=False)
+        self.num_bindings = int(self.engine.num_bindings)
+        self.input_indices = []
+        self.output_indices = []
+
+        for i in range(self.num_bindings):
+            if self.engine.binding_is_input(i):
+                self.input_indices.append(i)
+            else:
+                self.output_indices.append(i)
+
+        if len(self.input_indices) != 1:
+            raise RuntimeError(f"Expected exactly 1 TensorRT input, found {len(self.input_indices)}")
+        if len(self.output_indices) < 1:
+            raise RuntimeError("Expected at least 1 TensorRT output.")
+
+        self.input_idx = self.input_indices[0]
+        self.output_idx = self.output_indices[0]
+        self.input_name = self.engine.get_binding_name(self.input_idx)
+
+        raw_input_shape = tuple(int(x) for x in self.engine.get_binding_shape(self.input_idx))
+
+        # Handle explicit-batch dynamic engines such as [-1, 3, H, W].
+        if any(dim < 0 for dim in raw_input_shape):
+            self.imgsz = int(CONFIG["imgsz"])
+            self.input_shape = (1, 3, self.imgsz, self.imgsz)
+            self.context.set_binding_shape(self.input_idx, self.input_shape)
         else:
-            tensor = canvas.astype(self.input_binding["dtype"], copy=False)
+            self.input_shape = raw_input_shape
+            # Supports NCHW. For YOLO exports this is normally [1, 3, imgsz, imgsz].
+            if len(self.input_shape) != 4:
+                raise RuntimeError(f"Expected NCHW input shape, got {self.input_shape}")
+            self.imgsz = int(self.input_shape[2])
 
-        if self.input_layout == "NCHW":
-            tensor = tensor.transpose(2, 0, 1)[np.newaxis]
+        self.bindings = [None] * self.num_bindings
+        self.host_device = {}
+        self.binding_shapes = {}
+
+        for i in range(self.num_bindings):
+            name = self.engine.get_binding_name(i)
+            dtype = trt.nptype(self.engine.get_binding_dtype(i))
+            shape = tuple(int(x) for x in self.context.get_binding_shape(i))
+            if any(dim < 0 for dim in shape):
+                shape = tuple(int(x) for x in self.engine.get_binding_shape(i))
+            if any(dim < 0 for dim in shape):
+                raise RuntimeError(f"Binding {name} still has dynamic shape {shape}. Rebuild engine with fixed shape or set profile.")
+
+            size = int(trt.volume(shape))
+            host_mem = cuda.pagelocked_empty(size, dtype)
+            device_mem = cuda.mem_alloc(host_mem.nbytes)
+            self.bindings[i] = int(device_mem)
+            self.host_device[i] = HostDeviceMem(host_mem, device_mem)
+            self.binding_shapes[i] = shape
+
+            role = "input" if self.engine.binding_is_input(i) else "output"
+            log.info(f"TensorRT binding {i}: {role} name={name} shape={shape} dtype={dtype}")
+
+        out_shape = self.binding_shapes[self.output_idx]
+        self.output_shape = out_shape
+
+        # Detect YOLOv5 [1,N,85] vs YOLOv8 [1,84,N].
+        self.is_v5 = (len(out_shape) == 3 and out_shape[2] in (85, 80 + 5))
+
+        self._warmup()
+
+        # Pop the context created in __init__. It will be pushed again inside
+        # _execute() from whichever camera thread is running inference.
+        self.cuda_ctx.pop()
+
+        log.info(
+            f"TensorRT engine loaded on Jetson GPU: {model_path} | "
+            f"input={self.input_shape} | output={self.output_shape} | imgsz={self.imgsz} | v5={self.is_v5}"
+        )
+
+    def _execute(self, inp):
+        # The CUDA context must be current in the thread that touches CUDA.
+        self.cuda_ctx.push()
+        try:
+            inp = np.ascontiguousarray(inp.astype(np.float32, copy=False))
+            input_mem = self.host_device[self.input_idx]
+            if inp.size != input_mem.host.size:
+                raise RuntimeError("Input size mismatch: got {}, engine expects {}".format(inp.shape, self.input_shape))
+
+            np.copyto(input_mem.host, inp.ravel())
+            cuda.memcpy_htod_async(input_mem.device, input_mem.host, self.stream)
+
+            ok = self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+            if not ok:
+                raise RuntimeError("TensorRT execute_async_v2 failed.")
+
+            outputs = []
+            for out_idx in self.output_indices:
+                out_mem = self.host_device[out_idx]
+                cuda.memcpy_dtoh_async(out_mem.host, out_mem.device, self.stream)
+                outputs.append((out_idx, out_mem.host))
+
+            self.stream.synchronize()
+
+            reshaped = []
+            for out_idx, host in outputs:
+                shape = tuple(int(x) for x in self.context.get_binding_shape(out_idx))
+                if any(dim < 0 for dim in shape):
+                    shape = self.binding_shapes[out_idx]
+                reshaped.append(np.array(host).reshape(shape).copy())
+            return reshaped
+        finally:
+            self.cuda_ctx.pop()
+
+    def _warmup(self):
+        dummy = np.zeros(self.input_shape, dtype=np.float32)
+        with self.lock:
+            _ = self._execute(dummy)
+        log.info("TensorRT warmup OK")
+
+    def infer_raw(self, inp: np.ndarray):
+        """Run TensorRT on pre-built NCHW float32 input. Returns raw output list."""
+        with self.lock:
+            return self._execute(inp)
+
+    def decode_output(self, out: np.ndarray, orig_hw: tuple) -> list:
+        """Decode raw TensorRT output for ONE image into detection dicts."""
+        h0, w0 = orig_hw
+        if self.is_v5:
+            preds = out    # [N, 85]
+            mask  = preds[:, 4] * preds[:, 5:].max(axis=1) > CONFIG["conf_threshold"]
+            preds = preds[mask]
+            if len(preds) == 0:
+                return []
+            boxes     = preds[:, :4]
+            obj       = preds[:, 4]
+            cls_probs = preds[:, 5:]
+            class_ids = cls_probs.argmax(axis=1)
+            scores    = obj * cls_probs[np.arange(len(preds)), class_ids]
         else:
-            tensor = tensor[np.newaxis]
-        return np.ascontiguousarray(tensor), scale, (pad_x, pad_y)
+            if len(out.shape) == 3 and out.shape[1] < out.shape[2]:
+                preds = out[0].T if out.ndim == 3 else out.T
+            else:
+                preds = out[0] if out.ndim == 3 else out
+            scores_all = preds[:, 4:]
+            class_ids  = scores_all.argmax(axis=1)
+            scores     = scores_all[np.arange(len(preds)), class_ids]
+            mask       = scores > CONFIG["conf_threshold"]
+            preds, class_ids, scores = preds[mask], class_ids[mask], scores[mask]
+            if len(preds) == 0:
+                return []
+            boxes = preds[:, :4]
 
-    def infer(self, bgr_frame: np.ndarray) -> List[dict]:
+        sx, sy = w0 / self.imgsz, h0 / self.imgsz
+        x1 = (boxes[:, 0] - boxes[:, 2] / 2) * sx
+        y1 = (boxes[:, 1] - boxes[:, 3] / 2) * sy
+        x2 = (boxes[:, 0] + boxes[:, 2] / 2) * sx
+        y2 = (boxes[:, 1] + boxes[:, 3] / 2) * sy
+
+        keep = cpu_nms(np.stack([x1,y1,x2,y2], axis=1), scores, CONFIG["iou_threshold"])
+        results = []
+        for i in keep:
+            cid = int(class_ids[i])
+            results.append({
+                "class_id":   cid,
+                "class_name": COCO_NAMES[cid] if cid < len(COCO_NAMES) else str(cid),
+                "confidence": round(float(scores[i]), 4),
+                "bbox_xyxy":  [round(float(x1[i]),1), round(float(y1[i]),1),
+                               round(float(x2[i]),1), round(float(y2[i]),1)],
+            })
+        return results
+
+    def infer_batch(self, batch_chw: np.ndarray, orig_shapes: list) -> list:
+        """
+        Run TensorRT on a batched [N,3,H,W] float32 tensor.
+        orig_shapes: list of (h, w) tuples for each image (for bbox rescaling).
+        Returns list of N detection-lists.
+        Engine MUST be built with max_batch >= N.
+        """
+        n = batch_chw.shape[0]
+        batch_chw = np.ascontiguousarray(batch_chw.astype(np.float32, copy=False))
+
+        self.cuda_ctx.push()
+        try:
+            # For dynamic-batch engines, update binding shape.
+            raw_in_shape = tuple(int(x) for x in self.engine.get_binding_shape(self.input_idx))
+            if any(dim < 0 for dim in raw_in_shape):
+                self.context.set_binding_shape(self.input_idx, (n, 3, self.imgsz, self.imgsz))
+
+            out_shape = tuple(int(x) for x in self.context.get_binding_shape(self.output_idx))
+            out_dtype = trt.nptype(self.engine.get_binding_dtype(self.output_idx))
+            out_size  = int(np.prod(out_shape))
+
+            inp_mem = self.host_device[self.input_idx]
+            np.copyto(inp_mem.host[:batch_chw.size], batch_chw.ravel())
+            cuda.memcpy_htod_async(inp_mem.device, inp_mem.host, self.stream)
+
+            ok = self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+            if not ok:
+                raise RuntimeError("TensorRT execute_async_v2 (batch) failed.")
+
+            out_host = cuda.pagelocked_empty(out_size, out_dtype)
+            cuda.memcpy_dtoh_async(out_host, self.host_device[self.output_idx].device, self.stream)
+            self.stream.synchronize()
+
+            raw = out_host.reshape(out_shape)   # [N, 84, anchors] or [N, anchors, 85]
+        finally:
+            self.cuda_ctx.pop()
+
+        results = []
+        for i in range(n):
+            results.append(self.decode_output(raw[i], orig_shapes[i]))
+        return results
         h0, w0 = bgr_frame.shape[:2]
-        inp, scale, pad = self._preprocess(bgr_frame)
+        img = cv2.resize(bgr_frame, (self.imgsz, self.imgsz))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        inp = img.transpose(2, 0, 1)[np.newaxis]  # 1,3,H,W
 
         with self.lock:
-            self.cuda_context.push()
-            try:
-                np.copyto(self.input_binding["host"], inp.ravel())
-                self.cuda.memcpy_htod_async(
-                    self.input_binding["device"],
-                    self.input_binding["host"],
-                    self.stream,
-                )
+            out = self._execute(inp)[0]
 
-                if self.uses_tensor_api and hasattr(self.context, "execute_async_v3"):
-                    ok = self.context.execute_async_v3(stream_handle=self.stream.handle)
-                else:
-                    ok = self.context.execute_async_v2(
-                        bindings=self.binding_ptrs,
-                        stream_handle=self.stream.handle,
-                    )
-                if not ok:
-                    raise RuntimeError("TensorRT inference failed")
-
-                for binding in self.output_bindings:
-                    self.cuda.memcpy_dtoh_async(
-                        binding["host"],
-                        binding["device"],
-                        self.stream,
-                    )
-                self.stream.synchronize()
-                outputs = [
-                    binding["host"].reshape(binding["shape"]).copy()
-                    for binding in self.output_bindings
-                ]
-            finally:
-                self.cuda_context.pop()
-
-        return self._postprocess(outputs, h0, w0, scale, pad)
-
-    def _postprocess(
-        self,
-        outputs: List[np.ndarray],
-        orig_h: int,
-        orig_w: int,
-        scale: float,
-        pad: Tuple[int, int],
-    ) -> List[dict]:
-        multi_output = self._postprocess_multi_output_nms(outputs, orig_h, orig_w, scale, pad)
-        if multi_output is not None:
-            return multi_output
-
-        out = np.asarray(outputs[0], dtype=np.float32)
-        preds = self._as_prediction_matrix(out)
-        if preds.size == 0:
-            return []
-
-        if preds.shape[1] == 6:
-            boxes_xyxy = preds[:, :4]
-            scores = preds[:, 4]
-            class_ids = preds[:, 5].astype(np.int32)
-        elif preds.shape[1] == 85:
-            obj = preds[:, 4]
+        if self.is_v5:
+            preds = out[0]  # [N, 85]
+            mask = preds[:, 4] * preds[:, 5:].max(axis=1) > CONFIG["conf_threshold"]
+            preds = preds[mask]
+            if len(preds) == 0:
+                return []
+            boxes = preds[:, :4]
+            obj   = preds[:, 4]
             cls_probs = preds[:, 5:]
             class_ids = cls_probs.argmax(axis=1)
             scores = obj * cls_probs[np.arange(len(preds)), class_ids]
-            boxes_xyxy = xywh_to_xyxy(preds[:, :4])
-        elif preds.shape[1] >= 84:
-            cls_probs = preds[:, 4:]
-            class_ids = cls_probs.argmax(axis=1)
-            scores = cls_probs[np.arange(len(preds)), class_ids]
-            boxes_xyxy = xywh_to_xyxy(preds[:, :4])
         else:
-            raise RuntimeError(f"Unsupported YOLO output shape: {out.shape}")
+            # YOLOv8 export is usually [1, 84, N]. Some engines may return [1, N, 84].
+            if len(out.shape) == 3 and out.shape[1] < out.shape[2]:
+                preds = out[0].T  # [N, 84]
+            elif len(out.shape) == 3:
+                preds = out[0]    # [N, 84]
+            else:
+                raise RuntimeError(f"Unsupported YOLO TensorRT output shape: {out.shape}")
 
-        mask = scores > CONFIG["conf_threshold"]
-        if not np.any(mask):
-            return []
+            scores_all = preds[:, 4:]
+            class_ids  = scores_all.argmax(axis=1)
+            scores     = scores_all[np.arange(len(preds)), class_ids]
+            mask = scores > CONFIG["conf_threshold"]
+            preds, class_ids, scores = preds[mask], class_ids[mask], scores[mask]
+            if len(preds) == 0:
+                return []
+            boxes = preds[:, :4]
 
-        boxes_xyxy = boxes_xyxy[mask]
-        scores = scores[mask]
-        class_ids = class_ids[mask]
-        boxes_xyxy = scale_boxes_from_engine(boxes_xyxy, orig_w, orig_h, scale, pad)
+        # xywh -> xyxy in original coords
+        sx, sy = w0 / self.imgsz, h0 / self.imgsz
+        x1 = (boxes[:, 0] - boxes[:, 2] / 2) * sx
+        y1 = (boxes[:, 1] - boxes[:, 3] / 2) * sy
+        x2 = (boxes[:, 0] + boxes[:, 2] / 2) * sx
+        y2 = (boxes[:, 1] + boxes[:, 3] / 2) * sy
 
-        keep = cpu_nms(boxes_xyxy, scores, CONFIG["iou_threshold"])
+        keep = cpu_nms(np.stack([x1,y1,x2,y2], axis=1), scores, CONFIG["iou_threshold"])
         results = []
         for i in keep:
             cid = int(class_ids[i])
@@ -384,134 +463,10 @@ class YOLOModel:
                 "class_id":   cid,
                 "class_name": COCO_NAMES[cid] if cid < len(COCO_NAMES) else str(cid),
                 "confidence": round(float(scores[i]), 4),
-                "bbox_xyxy":  [round(float(v), 1) for v in boxes_xyxy[i]],
+                "bbox_xyxy":  [round(float(x1[i]),1), round(float(y1[i]),1),
+                               round(float(x2[i]),1), round(float(y2[i]),1)],
             })
         return results
-
-    def _as_prediction_matrix(self, out: np.ndarray) -> np.ndarray:
-        out = np.squeeze(out)
-        if out.ndim == 1:
-            out = out.reshape(1, -1)
-        if out.ndim != 2:
-            raise RuntimeError(f"Unsupported YOLO output shape: {out.shape}")
-
-        # Ultralytics YOLOv8 TensorRT exports normally return [84, N].
-        # Some engines/plugins return [N, 84] or [N, 6].
-        if out.shape[0] in (84, 85) and out.shape[1] != out.shape[0]:
-            out = out.T
-        elif out.shape[0] < out.shape[1] and out.shape[0] > 6:
-            out = out.T
-        return out
-
-    def _postprocess_multi_output_nms(
-        self,
-        outputs: List[np.ndarray],
-        orig_h: int,
-        orig_w: int,
-        scale: float,
-        pad: Tuple[int, int],
-    ) -> Optional[List[dict]]:
-        if len(outputs) < 4:
-            return None
-
-        arrays = [np.asarray(o, dtype=np.float32) for o in outputs]
-        boxes_idx = next(
-            (i for i, arr in enumerate(arrays) if np.squeeze(arr).ndim >= 2 and np.squeeze(arr).shape[-1] == 4),
-            None,
-        )
-        if boxes_idx is None:
-            return None
-
-        boxes = np.squeeze(arrays[boxes_idx]).reshape(-1, 4)
-        count = len(boxes)
-        scalar_counts = [
-            int(np.ravel(arr)[0])
-            for i, arr in enumerate(arrays)
-            if i != boxes_idx and np.ravel(arr).size == 1
-        ]
-        if scalar_counts:
-            count = min(count, max(0, scalar_counts[0]))
-        if count == 0:
-            return []
-
-        candidates = []
-        for i, arr in enumerate(arrays):
-            if i == boxes_idx or np.ravel(arr).size == 1:
-                continue
-            flat = np.squeeze(arr).reshape(-1)
-            if len(flat) >= count:
-                candidates.append((i, flat[:count]))
-        if len(candidates) < 2:
-            return None
-
-        names = [b["name"].lower() for b in self.output_bindings]
-        named_score_idx = next(
-            (i for i, _ in candidates if "score" in names[i] or "conf" in names[i]),
-            None,
-        )
-        named_class_idx = next(
-            (i for i, _ in candidates if "class" in names[i] or "label" in names[i]),
-            None,
-        )
-
-        if named_score_idx is not None and named_class_idx is not None:
-            scores = next(values for i, values in candidates if i == named_score_idx)
-            class_ids = next(values for i, values in candidates if i == named_class_idx).astype(np.int32)
-        else:
-            score_candidates = [
-                item for item in candidates
-                if np.nanmin(item[1]) >= 0.0 and np.nanmax(item[1]) <= 1.0
-            ]
-            score_idx, scores = score_candidates[0] if score_candidates else candidates[0]
-            class_candidates = [item for item in candidates if item[0] != score_idx]
-            class_ids = class_candidates[0][1].astype(np.int32)
-
-        boxes = boxes[:count]
-        scores = scores[:count]
-        mask = scores > CONFIG["conf_threshold"]
-        if not np.any(mask):
-            return []
-
-        boxes = scale_boxes_from_engine(boxes[mask], orig_w, orig_h, scale, pad)
-        scores = scores[mask]
-        class_ids = class_ids[mask]
-        keep = cpu_nms(boxes, scores, CONFIG["iou_threshold"])
-
-        results = []
-        for i in keep:
-            cid = int(class_ids[i])
-            results.append({
-                "class_id":   cid,
-                "class_name": COCO_NAMES[cid] if cid < len(COCO_NAMES) else str(cid),
-                "confidence": round(float(scores[i]), 4),
-                "bbox_xyxy":  [round(float(v), 1) for v in boxes[i]],
-            })
-        return results
-
-
-def xywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
-    boxes = boxes.astype(np.float32, copy=False)
-    x1 = boxes[:, 0] - boxes[:, 2] / 2
-    y1 = boxes[:, 1] - boxes[:, 3] / 2
-    x2 = boxes[:, 0] + boxes[:, 2] / 2
-    y2 = boxes[:, 1] + boxes[:, 3] / 2
-    return np.stack([x1, y1, x2, y2], axis=1)
-
-
-def scale_boxes_from_engine(
-    boxes: np.ndarray,
-    orig_w: int,
-    orig_h: int,
-    scale: float,
-    pad: Tuple[int, int],
-) -> np.ndarray:
-    pad_x, pad_y = pad
-    boxes = boxes.astype(np.float32, copy=True)
-    boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale
-    boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / scale
-    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, orig_w - 1)
-    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, orig_h - 1)
-    return boxes
 
 
 def cpu_nms(boxes, scores, iou_thresh):
@@ -537,7 +492,7 @@ def cpu_nms(boxes, scores, iou_thresh):
 COLORS = [(0,255,0),(255,100,0),(0,100,255),(255,255,0),(0,255,255),
           (255,0,255),(128,255,0),(0,128,255),(255,128,0),(128,0,255)]
 
-def draw_frame(frame: np.ndarray, detections: List[dict], fps: float, cam_id: str) -> np.ndarray:
+def draw_frame(frame, detections, fps, cam_id):
     img = frame.copy()
     for d in detections:
         x1,y1,x2,y2 = [int(v) for v in d["bbox_xyxy"]]
@@ -556,41 +511,85 @@ def draw_frame(frame: np.ndarray, detections: List[dict], fps: float, cam_id: st
     return img
 
 
-# ─────────────────────────── External API push ────────────────────────────────
-def push_to_external_api(cam_id: str, record: dict):
-    """POST detection record to external API (non-blocking, best-effort)."""
+# ─────────────────────────── External API push (circuit breaker + queue) ──────
+_API_QUEUE      = collections.deque(maxlen=200)
+_API_QUEUE_LOCK = threading.Lock()
+_API_QUEUE_EVT  = threading.Event()
+
+_cb = {"fails": 0, "open": False, "open_until": 0.0}
+FAIL_THRESHOLD = 5
+COOLDOWN_SEC   = 30
+
+
+def _build_api_payloads(cam_id, record):
+    out = []
     for det in record.get("detections", []):
-        bbox = det.get("bbox_xyxy", [0,0,0,0])
-        x1,y1,x2,y2 = bbox
-        payload = {
+        x1, y1, x2, y2 = det.get("bbox_xyxy", [0, 0, 0, 0])
+        out.append({
             "device_name": CONFIG["device_name"],
             "data": {
-                "timestamp":  record["timestamp"],
-                "type":       det["class_name"],
-                "color":      "",           # not yet available from model
-                "brand":      "",           # not yet available from model
-                "x":          round(float(x1), 4),
-                "y":          round(float(y1), 4),
-                "width":      round(float(x2 - x1), 4),
-                "height":     round(float(y2 - y1), 4),
-                "camera_id":  cam_id,
-                "jetson_id":  CONFIG["jetson_id"],
-                "track_id":   str(det.get("track_id", "")),
+                "timestamp": record["timestamp"],
+                "type":      det["class_name"],
+                "color":     "",
+                "brand":     "",
+                "x":         round(float(x1), 4),
+                "y":         round(float(y1), 4),
+                "width":     round(float(x2 - x1), 4),
+                "height":    round(float(y2 - y1), 4),
+                "camera_id": cam_id,
+                "jetson_id": CONFIG["jetson_id"],
+                "track_id":  str(det.get("track_id", "")),
             }
-        }
-        try:
-            requests.post(CONFIG["external_api"], json=payload, timeout=2)
-        except Exception as e:
-            log.warning(f"[{cam_id}] External API push failed: {e}")
+        })
+    return out
 
 
-def push_external_async(cam_id: str, record: dict):
-    t = threading.Thread(target=push_to_external_api, args=(cam_id, record), daemon=True)
-    t.start()
+def _api_worker():
+    sess = requests.Session()
+    while True:
+        _API_QUEUE_EVT.wait(timeout=5)
+        _API_QUEUE_EVT.clear()
+        if _cb["open"]:
+            if time.time() < _cb["open_until"]:
+                continue
+            _cb["open"] = False; _cb["fails"] = 0
+            log.info("External API circuit CLOSED — retrying")
+        while True:
+            with _API_QUEUE_LOCK:
+                if not _API_QUEUE: break
+                cam_id, record = _API_QUEUE.popleft()
+            for payload in _build_api_payloads(cam_id, record):
+                try:
+                    sess.post(CONFIG["external_api"], json=payload, timeout=2)
+                    if _cb["fails"]:
+                        log.info("External API OK — resetting fail count")
+                    _cb["fails"] = 0
+                except Exception as e:
+                    _cb["fails"] += 1
+                    if _cb["fails"] == FAIL_THRESHOLD:
+                        _cb["open"] = True
+                        _cb["open_until"] = time.time() + COOLDOWN_SEC
+                        log.warning(
+                            f"[{cam_id}] External API unreachable ({e}). "
+                            f"Circuit OPEN — pausing {COOLDOWN_SEC}s."
+                        )
+                    if _cb["open"]: break
+            if _cb["open"]: break
+
+
+threading.Thread(target=_api_worker, daemon=True, name="api-worker").start()
+
+
+def push_external_async(cam_id, record):
+    if not record.get("detections"):
+        return
+    with _API_QUEUE_LOCK:
+        _API_QUEUE.append((cam_id, record))
+    _API_QUEUE_EVT.set()
 
 
 # ─────────────────────────── SSE broadcast ────────────────────────────────────
-def broadcast_sse(cam_id: str, record: dict):
+def broadcast_sse(cam_id, record):
     data = json.dumps(record)
     with sse_sub_lock:
         # per-camera subscribers
@@ -604,58 +603,55 @@ def broadcast_sse(cam_id: str, record: dict):
 
 
 # ─────────────────────────── Pipeline loop per camera ─────────────────────────
-def gst_rtsp_pipelines(source: str):
-    latency = int(CONFIG.get("rtsp_latency_ms", 100))
-    appsink = "appsink drop=1 max-buffers=1 sync=false"
+CAPTURE_OPEN_LOCK = threading.Lock()
 
-    # JetPack 4/5/6 preferred path. nvv4l2decoder uses Jetson HW decode.
-    yield (
-        "nvv4l2decoder",
-        f"rtspsrc location={source} latency={latency} protocols=tcp ! "
-        "rtph264depay ! h264parse ! nvv4l2decoder enable-max-performance=1 ! "
-        "nvvidconv ! video/x-raw,format=BGRx ! videoconvert ! "
-        f"video/x-raw,format=BGR ! {appsink}",
-    )
+def open_capture(cam_id, source):
+    """Open RTSP capture safely on Jetson Nano.
 
-    # Older JetPack fallback.
-    yield (
-        "omxh264dec",
-        f"rtspsrc location={source} latency={latency} protocols=tcp ! "
-        "rtph264depay ! h264parse ! omxh264dec ! nvvidconv ! "
-        "video/x-raw,format=BGRx ! videoconvert ! "
-        f"video/x-raw,format=BGR ! {appsink}",
-    )
+    Important: do not let 5 camera threads create VideoCapture at the same time.
+    Some OpenCV/GStreamer/FFmpeg builds on Jetson can segfault during concurrent RTSP open.
+    """
+    with CAPTURE_OPEN_LOCK:
+        if source.startswith("rtsp://") and CONFIG.get("enable_gstreamer", False):
+            gst_candidates = [
+                (
+                    f"rtspsrc location={source} protocols=tcp latency=200 drop-on-latency=true ! "
+                    "rtph264depay ! h264parse ! nvv4l2decoder ! nvvidconv ! "
+                    "video/x-raw,format=BGRx ! videoconvert ! "
+                    "video/x-raw,format=BGR ! appsink drop=1 sync=false max-buffers=1"
+                ),
+                (
+                    f"rtspsrc location={source} protocols=tcp latency=200 drop-on-latency=true ! "
+                    "rtph264depay ! h264parse ! omxh264dec ! nvvidconv ! "
+                    "video/x-raw,format=BGRx ! videoconvert ! "
+                    "video/x-raw,format=BGR ! appsink drop=1 sync=false max-buffers=1"
+                ),
+                (
+                    f"rtspsrc location={source} protocols=tcp latency=200 drop-on-latency=true ! "
+                    "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
+                    "video/x-raw,format=BGR ! appsink drop=1 sync=false max-buffers=1"
+                ),
+            ]
 
-    # CPU decode fallback through GStreamer. Still useful when OpenCV's direct
-    # RTSP backend is unreliable, but it will not reduce CPU load.
-    yield (
-        "avdec_h264",
-        f"rtspsrc location={source} latency={latency} protocols=tcp ! "
-        "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
-        f"video/x-raw,format=BGR ! {appsink}",
-    )
+            for gst in gst_candidates:
+                cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+                if cap.isOpened():
+                    log.info(f"[{cam_id}] GStreamer capture OK")
+                    return cap
 
+            log.warning(f"[{cam_id}] GStreamer capture failed, falling back to OpenCV/FFmpeg")
 
-def open_capture(cam_id: str, source: str) -> cv2.VideoCapture:
-    """Try GStreamer first, then fall back to OpenCV's default RTSP backend."""
-    if CONFIG.get("use_gstreamer", True) and source.startswith("rtsp://"):
-        for name, gst in gst_rtsp_pipelines(source):
-            cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-            if cap.isOpened():
-                log.info(f"[{cam_id}] GStreamer opened with {name}")
-                return cap
-            cap.release()
-            log.warning(f"[{cam_id}] GStreamer pipeline failed: {name}")
-
-        log.warning(f"[{cam_id}] All GStreamer pipelines failed, falling back to OpenCV RTSP")
-
-    cap = cv2.VideoCapture(source)
-    return cap
+        # Safer fallback. OPENCV_FFMPEG_CAPTURE_OPTIONS above requests RTSP over TCP.
+        cap = cv2.VideoCapture(source)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+        return cap
 
 
-def pipeline_loop(cam_id: str, source: str, model: YOLOModel):
-    state = cam_state[cam_id]
-    fps_times: collections.deque = collections.deque(maxlen=30)
+def capture_loop(cam_id, source):
+    """Read frames only. This thread must not call TensorRT/CUDA."""
     frame_idx = 0
 
     while True:
@@ -673,52 +669,177 @@ def pipeline_loop(cam_id: str, source: str, model: YOLOModel):
                 log.warning(f"[{cam_id}] Frame read failed, reconnecting...")
                 break
 
-            t0 = time.time()
-            detections = model.infer(frame)
-            latency_ms = round((time.time() - t0) * 1000, 1)
-
-            fps_times.append(time.time())
-            if len(fps_times) >= 2:
-                fps = (len(fps_times)-1) / (fps_times[-1] - fps_times[0])
-            else:
-                fps = 0.0
-
-            drawn = draw_frame(frame, detections, fps, cam_id)
-            _, jpg = cv2.imencode(".jpg", drawn, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            jpg_bytes = jpg.tobytes()
-
-            with state["lock"]:
-                state["frame_jpg"]   = jpg_bytes
-                state["detections"]  = detections
-                state["fps"]         = fps
-                state["frame_count"] = frame_idx
-
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            record = {
-                "frame":          frame_idx,
-                "timestamp":      ts,
-                "camera_id":      cam_id,
-                "latency_ms":     latency_ms,
-                "fps":            round(fps, 1),
-                "num_detections": len(detections),
-                "detections":     detections,
-            }
-
-            with detection_log_lock:
-                detection_log.append(record)
-                if len(detection_log) > MAX_LOG:
-                    detection_log.pop(0)
-
-            broadcast_sse(cam_id, record)
-
-            # Push to external API in background thread (best-effort)
-            if detections:
-                push_external_async(cam_id, record)
+            slot = latest_frame_state[cam_id]
+            with slot["lock"]:
+                # Keep only the newest frame. This prevents RTSP backlog and keeps latency low.
+                slot["frame"] = frame
+                slot["frame_count"] = frame_idx
+                slot["updated_at"] = time.time()
 
             frame_idx += 1
 
         cap.release()
         time.sleep(2)
+
+
+def _postprocess_one(cam_id, frame, detections, fps, frame_idx, latency_ms):
+    """
+    CPU post-processing: draw bboxes, encode JPEG, update shared state, push SSE/log.
+    Runs in a thread pool so the GPU inference loop never waits for it.
+    """
+    drawn = draw_frame(frame, detections, fps, cam_id)
+    _, jpg = cv2.imencode(".jpg", drawn, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    jpg_bytes = jpg.tobytes()
+
+    state = cam_state[cam_id]
+    with state["lock"]:
+        state["frame_jpg"]   = jpg_bytes
+        state["detections"]  = detections
+        state["fps"]         = fps
+        state["frame_count"] = frame_idx
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    record = {
+        "frame":          frame_idx,
+        "timestamp":      ts,
+        "camera_id":      cam_id,
+        "latency_ms":     latency_ms,
+        "fps":            round(fps, 1),
+        "num_detections": len(detections),
+        "detections":     detections,
+    }
+    with detection_log_lock:
+        detection_log.append(record)
+        if len(detection_log) > MAX_LOG:
+            detection_log.pop(0)
+
+    broadcast_sse(cam_id, record)
+    if detections:
+        push_external_async(cam_id, record)
+
+
+def inference_worker(model):
+    """
+    Batched TensorRT inference worker.
+
+    Strategy:
+      1. Every loop tick, collect the LATEST frame from each camera (skip if unchanged).
+      2. Preprocess all available frames on CPU in parallel (resize+normalize via numpy).
+      3. Stack into a single batch tensor and run ONE TensorRT call for all cameras.
+         → GPU sees a larger workload per call → much higher utilisation.
+      4. Dispatch draw+JPEG+SSE for each result into a thread-pool so GPU loop never
+         waits for slow CPU work.
+
+    Requires a TensorRT engine built with max_batch_size >= num_cameras.
+    Build command (run on the same Jetson):
+      /usr/src/tensorrt/bin/trtexec \\
+        --onnx=yolov8n.onnx \\
+        --saveEngine=yolov8n_b5.engine \\
+        --fp16 \\
+        --minShapes=images:1x3x{imgsz}x{imgsz} \\
+        --optShapes=images:5x3x{imgsz}x{imgsz} \\
+        --maxShapes=images:5x3x{imgsz}x{imgsz}
+
+    If you still have a batch=1 engine, the worker gracefully falls back to
+    sequential batch-1 calls (same as before) but with async postprocessing.
+    """
+    import concurrent.futures
+    postprocess_pool = concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(cam_ids), thread_name_prefix="postproc"
+    )
+
+    fps_times      = {cid: collections.deque(maxlen=30) for cid in cam_ids}
+    last_processed = {cid: -1 for cid in cam_ids}
+
+    imgsz = model.imgsz
+
+    # Detect whether the engine supports batch > 1.
+    # engine.max_batch_size is set at build time.
+    try:
+        engine_max_batch = int(model.engine.max_batch_size)
+    except Exception:
+        engine_max_batch = 1
+    batch_capable = engine_max_batch >= len(cam_ids)
+
+    if batch_capable:
+        log.info(f"Inference worker: BATCH MODE (max_batch={engine_max_batch}, cameras={len(cam_ids)})")
+    else:
+        log.info(
+            f"Inference worker: SEQUENTIAL fallback (engine max_batch={engine_max_batch}, "
+            f"need {len(cam_ids)}). Rebuild engine with --maxShapes=images:{len(cam_ids)}x3x{imgsz}x{imgsz} for full GPU utilisation."
+        )
+
+    def preprocess(frame):
+        """Resize + normalize a single BGR frame → float32 CHW."""
+        img = cv2.resize(frame, (imgsz, imgsz), interpolation=cv2.INTER_LINEAR)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+        img /= 255.0
+        return img.transpose(2, 0, 1)   # CHW
+
+    while True:
+        # ── 1. Collect available frames ──────────────────────────────────────
+        ready_cids, ready_frames, ready_idxs = [], [], []
+        for cid in cam_ids:
+            slot = latest_frame_state[cid]
+            with slot["lock"]:
+                frame    = None if slot["frame"] is None else slot["frame"]
+                fidx     = slot["frame_count"]
+            if frame is None or fidx == last_processed[cid]:
+                continue
+            ready_cids.append(cid)
+            ready_frames.append(frame)
+            ready_idxs.append(fidx)
+
+        if not ready_cids:
+            time.sleep(0.001)
+            continue
+
+        t_infer_start = time.time()
+
+        # ── 2. Preprocess all frames in parallel on CPU ───────────────────────
+        # Each frame is independent → use thread pool for speed on multi-core CPU.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(ready_cids)) as pp:
+            chw_list = list(pp.map(preprocess, ready_frames))
+
+        # ── 3. TensorRT inference ─────────────────────────────────────────────
+        if batch_capable and len(ready_cids) > 1:
+            # Stack into [N, 3, H, W] and call GPU once.
+            batch_tensor = np.stack(chw_list, axis=0)   # [N, C, H, W]
+            try:
+                orig_shapes = [f.shape[:2] for f in ready_frames]
+                batch_out = model.infer_batch(batch_tensor, orig_shapes)
+            except Exception as e:
+                log.exception(f"Batch TensorRT inference failed: {e}")
+                batch_out = [[] for _ in ready_cids]
+        else:
+            # Sequential batch=1 calls (fallback or single frame).
+            batch_out = []
+            for cid, chw in zip(ready_cids, chw_list):
+                inp = chw[np.newaxis]   # [1, C, H, W]
+                try:
+                    outs = model.infer_raw(inp)
+                    dets = model.decode_output(outs[0], ready_frames[ready_cids.index(cid)].shape[:2])
+                except Exception as e:
+                    log.exception(f"[{cid}] TensorRT inference failed: {e}")
+                    dets = []
+                batch_out.append(dets)
+
+        t_infer_end = time.time()
+        total_latency_ms = round((t_infer_end - t_infer_start) * 1000, 1)
+        per_frame_ms = round(total_latency_ms / max(len(ready_cids), 1), 1)
+
+        # ── 4. Post-process each result asynchronously ───────────────────────
+        for cid, frame, fidx, detections in zip(ready_cids, ready_frames, ready_idxs, batch_out):
+            last_processed[cid] = fidx
+
+            times = fps_times[cid]
+            times.append(time.time())
+            fps = (len(times)-1) / (times[-1] - times[0]) if len(times) >= 2 else 0.0
+
+            # Fire-and-forget: draw + JPEG encode + SSE push in background.
+            postprocess_pool.submit(
+                _postprocess_one, cid, frame, detections, fps, fidx, per_frame_ms
+            )
 
 
 # ─────────────────────────── FastAPI ──────────────────────────────────────────
@@ -727,7 +848,7 @@ MJPEG_DELAY = 1.0 / CONFIG["mjpeg_fps"]
 
 
 # ── MJPEG generator ────────────────────────────────────────────────────────────
-def mjpeg_gen(cam_id: str):
+def mjpeg_gen(cam_id):
     state = cam_state[cam_id]
     while True:
         with state["lock"]:
@@ -747,7 +868,7 @@ def cam_video(cam_num: int):
 
 
 # ── SSE per camera ─────────────────────────────────────────────────────────────
-async def cam_sse_gen(cam_id: str):
+async def cam_sse_gen(cam_id):
     q: asyncio.Queue = asyncio.Queue(maxsize=100)
     with sse_sub_lock:
         per_cam_sse_subscribers[cam_id].append(q)
@@ -813,7 +934,7 @@ def get_detections(
 
 
 @app.post("/detections")
-async def post_detection(record: dict):
+async def post_detection(record):
     with detection_log_lock:
         detection_log.append(record)
         if len(detection_log) > MAX_LOG:
@@ -832,7 +953,7 @@ def cam_loglive_redirect(cam_num: int):
 
 
 # ── HTML dashboards ────────────────────────────────────────────────────────────
-def cam_live_html(cam_id: str) -> str:
+def cam_live_html(cam_id):
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -893,7 +1014,7 @@ src.onerror = () => setTimeout(() => location.reload(), 3000);
 </body></html>"""
 
 
-def log_live_html() -> str:
+def log_live_html():
     cam_links = "".join(
         f'<a href="/cam{i}/live">cam{i}</a> ' for i in range(1, 6)
     )
@@ -1038,16 +1159,28 @@ def root():
 
 
 # ─────────────────────────── Startup ──────────────────────────────────────────
-def start_pipelines(model: YOLOModel):
+def start_pipelines(model):
+    # Start RTSP capture threads first. They only read frames and update latest_frame_state.
     for cam_id, source in CONFIG["cameras"].items():
         t = threading.Thread(
-            target=pipeline_loop,
-            args=(cam_id, source, model),
+            target=capture_loop,
+            args=(cam_id, source),
             daemon=True,
-            name=f"pipeline-{cam_id}",
+            name=f"capture-{cam_id}",
         )
         t.start()
-        log.info(f"Started pipeline thread: {cam_id}")
+        log.info(f"Started capture thread: {cam_id}")
+        time.sleep(float(CONFIG.get("capture_startup_stagger_sec", 0.0)))
+
+    # Start exactly one TensorRT inference thread. CUDA/TensorRT is used only here.
+    t = threading.Thread(
+        target=inference_worker,
+        args=(model,),
+        daemon=True,
+        name="tensorrt-inference-worker",
+    )
+    t.start()
+    log.info("Started TensorRT inference worker")
 
 
 if __name__ == "__main__":
