@@ -7,7 +7,7 @@ CONFIG = {
 
     # Portable model artifact. Let DeepStream/TensorRT build the engine on the
     # Jetson Nano unless the .engine was generated on this exact Nano stack.
-    "model_path":     "models/pipeline_1/exports/yolo26n_opset12.onnx",
+    "model_path":     "models/pipeline_beta/yolov8n.onnx",
     "conf_threshold": 0.25,
     "iou_threshold":  0.45,
     "imgsz":          640,
