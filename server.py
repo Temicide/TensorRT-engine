@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Multi-Camera YOLO ONNX Jetson Pipeline
+Multi-Camera YOLO TensorRT Jetson Pipeline
 5 RTSP streams -> single YOLO model -> per-camera MJPEG + SSE + log
 All detection logs POST to: http://10.0.11.153:8080/api/v1/raw_data
 
@@ -22,11 +22,11 @@ import collections
 import uuid
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-import onnxruntime as ort
 import requests
 from fastapi import FastAPI, Query, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse
@@ -95,59 +95,286 @@ global_sse_subscribers: list[asyncio.Queue] = []
 per_cam_sse_subscribers: dict[str, list[asyncio.Queue]] = {cid: [] for cid in cam_ids}
 sse_sub_lock = threading.Lock()
 
-# ─────────────────────────── ONNX model (shared, thread-safe) ─────────────────
+# ───────────────────────── TensorRT model (shared, thread-safe) ───────────────
 class YOLOModel:
     def __init__(self, model_path: str):
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        self.sess = ort.InferenceSession(model_path, providers=providers)
-        self.input_name = self.sess.get_inputs()[0].name
-        inp = self.sess.get_inputs()[0]
-        self.imgsz = inp.shape[2] if isinstance(inp.shape[2], int) else CONFIG["imgsz"]
-        out_shape = self.sess.get_outputs()[0].shape
-        # Detect YOLOv5 [1,N,85] vs YOLOv8 [1,84,N]
-        self.is_v5 = (len(out_shape) == 3 and out_shape[2] in (85, 80 + 5))
+        model_file = Path(model_path)
+        if not model_file.is_absolute():
+            model_file = Path(__file__).resolve().parent / model_file
+        if not model_file.exists():
+            raise FileNotFoundError(f"TensorRT engine not found: {model_file}")
+
+        try:
+            import tensorrt as trt
+            import pycuda.driver as cuda
+        except ImportError as exc:
+            raise RuntimeError(
+                "TensorRT engine inference requires Python packages 'tensorrt' "
+                "and 'pycuda' on the Jetson runtime."
+            ) from exc
+
+        self.trt = trt
+        self.cuda = cuda
         self.lock = threading.Lock()
-        log.info(f"Model loaded: {model_path} | imgsz={self.imgsz} | v5={self.is_v5}")
+        self.trt_logger = trt.Logger(trt.Logger.WARNING)
+
+        cuda.init()
+        self.cuda_context = cuda.Device(0).make_context()
+        try:
+            runtime = trt.Runtime(self.trt_logger)
+            with model_file.open("rb") as f:
+                self.engine = runtime.deserialize_cuda_engine(f.read())
+            if self.engine is None:
+                raise RuntimeError(f"Failed to deserialize TensorRT engine: {model_file}")
+
+            self.context = self.engine.create_execution_context()
+            self.uses_tensor_api = hasattr(self.engine, "num_io_tensors")
+            self.bindings = self._inspect_bindings()
+
+            inputs = [b for b in self.bindings if b["is_input"]]
+            if len(inputs) != 1:
+                raise RuntimeError(f"Expected one engine input, found {len(inputs)}")
+            self.input_binding = inputs[0]
+            self.output_bindings = [b for b in self.bindings if not b["is_input"]]
+            if not self.output_bindings:
+                raise RuntimeError("TensorRT engine has no output bindings")
+
+            self.input_shape = self._resolve_input_shape(self.input_binding["shape"])
+            self._set_input_shape(self.input_binding["name"], self.input_shape)
+            self._derive_input_layout()
+            self._allocate_buffers()
+        finally:
+            self.cuda_context.pop()
+
+        output_desc = ", ".join(
+            f"{b['name']}:{tuple(b['shape'])}/{np.dtype(b['dtype']).name}"
+            for b in self.output_bindings
+        )
+        log.info(
+            "TensorRT engine loaded: %s | input=%s:%s/%s | outputs=%s",
+            model_path,
+            self.input_binding["name"],
+            self.input_shape,
+            np.dtype(self.input_binding["dtype"]).name,
+            output_desc,
+        )
+
+    def _inspect_bindings(self) -> list[dict]:
+        bindings = []
+        if self.uses_tensor_api:
+            for i in range(self.engine.num_io_tensors):
+                name = self.engine.get_tensor_name(i)
+                mode = self.engine.get_tensor_mode(name)
+                bindings.append({
+                    "index": i,
+                    "name": name,
+                    "is_input": mode == self.trt.TensorIOMode.INPUT,
+                    "shape": tuple(self.engine.get_tensor_shape(name)),
+                    "dtype": np.dtype(self.trt.nptype(self.engine.get_tensor_dtype(name))),
+                })
+        else:
+            for i in range(self.engine.num_bindings):
+                bindings.append({
+                    "index": i,
+                    "name": self.engine.get_binding_name(i),
+                    "is_input": self.engine.binding_is_input(i),
+                    "shape": tuple(self.engine.get_binding_shape(i)),
+                    "dtype": np.dtype(self.trt.nptype(self.engine.get_binding_dtype(i))),
+                })
+        return bindings
+
+    def _resolve_input_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
+        if len(shape) != 4:
+            raise RuntimeError(f"Expected 4D YOLO input, got {shape}")
+
+        resolved = [int(d) for d in shape]
+        if resolved[0] < 0:
+            resolved[0] = 1
+
+        # Prefer the engine's static dimensions. CONFIG["imgsz"] only fills
+        # dynamic dimensions when the engine was built with an optimization profile.
+        if resolved[1] == 3 or resolved[1] < 0:
+            if resolved[1] < 0:
+                resolved[1] = 3
+            if resolved[2] < 0:
+                resolved[2] = int(CONFIG["imgsz"])
+            if resolved[3] < 0:
+                resolved[3] = int(CONFIG["imgsz"])
+        elif resolved[3] == 3 or resolved[3] < 0:
+            if resolved[1] < 0:
+                resolved[1] = int(CONFIG["imgsz"])
+            if resolved[2] < 0:
+                resolved[2] = int(CONFIG["imgsz"])
+            if resolved[3] < 0:
+                resolved[3] = 3
+        else:
+            raise RuntimeError(f"Cannot infer YOLO input layout from shape {shape}")
+
+        return tuple(resolved)
+
+    def _set_input_shape(self, name: str, shape: tuple[int, ...]) -> None:
+        if self.uses_tensor_api and hasattr(self.context, "set_input_shape"):
+            if not self.context.set_input_shape(name, shape):
+                raise RuntimeError(f"TensorRT rejected input shape {shape} for {name}")
+        elif any(d < 0 for d in self.input_binding["shape"]):
+            if not self.context.set_binding_shape(self.input_binding["index"], shape):
+                raise RuntimeError(f"TensorRT rejected input shape {shape} for {name}")
+
+    def _derive_input_layout(self) -> None:
+        shape = self.input_shape
+        if shape[1] == 3:
+            self.input_layout = "NCHW"
+            self.input_h = int(shape[2])
+            self.input_w = int(shape[3])
+        elif shape[3] == 3:
+            self.input_layout = "NHWC"
+            self.input_h = int(shape[1])
+            self.input_w = int(shape[2])
+        else:
+            raise RuntimeError(f"Unsupported YOLO input shape: {shape}")
+        self.imgsz = self.input_h if self.input_h == self.input_w else (self.input_h, self.input_w)
+
+    def _binding_runtime_shape(self, binding: dict) -> tuple[int, ...]:
+        if self.uses_tensor_api and hasattr(self.context, "get_tensor_shape"):
+            shape = tuple(self.context.get_tensor_shape(binding["name"]))
+        elif hasattr(self.context, "get_binding_shape"):
+            shape = tuple(self.context.get_binding_shape(binding["index"]))
+        else:
+            shape = binding["shape"]
+
+        if any(int(d) < 0 for d in shape):
+            raise RuntimeError(
+                f"Dynamic shape for binding {binding['name']} was not resolved: {shape}"
+            )
+        return tuple(int(d) for d in shape)
+
+    def _allocate_buffers(self) -> None:
+        self.stream = self.cuda.Stream()
+        self.binding_ptrs = [0] * len(self.bindings)
+
+        for binding in self.bindings:
+            shape = self._binding_runtime_shape(binding)
+            binding["shape"] = shape
+            size = int(np.prod(shape))
+            host = self.cuda.pagelocked_empty(size, binding["dtype"])
+            device = self.cuda.mem_alloc(host.nbytes)
+            binding["host"] = host
+            binding["device"] = device
+            self.binding_ptrs[binding["index"]] = int(device)
+
+            if self.uses_tensor_api and hasattr(self.context, "set_tensor_address"):
+                self.context.set_tensor_address(binding["name"], int(device))
+
+    def _preprocess(self, bgr_frame: np.ndarray) -> tuple[np.ndarray, float, tuple[int, int]]:
+        h0, w0 = bgr_frame.shape[:2]
+        scale = min(self.input_w / w0, self.input_h / h0)
+        new_w = max(1, int(round(w0 * scale)))
+        new_h = max(1, int(round(h0 * scale)))
+        pad_x = (self.input_w - new_w) // 2
+        pad_y = (self.input_h - new_h) // 2
+
+        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
+        resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        canvas = np.full((self.input_h, self.input_w, 3), 114, dtype=np.uint8)
+        canvas[pad_y:pad_y + new_h, pad_x:pad_x + new_w] = resized
+
+        if np.issubdtype(self.input_binding["dtype"], np.floating):
+            tensor = canvas.astype(np.float32) / 255.0
+            tensor = tensor.astype(self.input_binding["dtype"], copy=False)
+        else:
+            tensor = canvas.astype(self.input_binding["dtype"], copy=False)
+
+        if self.input_layout == "NCHW":
+            tensor = tensor.transpose(2, 0, 1)[np.newaxis]
+        else:
+            tensor = tensor[np.newaxis]
+        return np.ascontiguousarray(tensor), scale, (pad_x, pad_y)
 
     def infer(self, bgr_frame: np.ndarray) -> list[dict]:
         h0, w0 = bgr_frame.shape[:2]
-        img = cv2.resize(bgr_frame, (self.imgsz, self.imgsz))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        inp = img.transpose(2, 0, 1)[np.newaxis]  # 1,3,H,W
+        inp, scale, pad = self._preprocess(bgr_frame)
 
         with self.lock:
-            out = self.sess.run(None, {self.input_name: inp})[0]
+            self.cuda_context.push()
+            try:
+                np.copyto(self.input_binding["host"], inp.ravel())
+                self.cuda.memcpy_htod_async(
+                    self.input_binding["device"],
+                    self.input_binding["host"],
+                    self.stream,
+                )
 
-        if self.is_v5:
-            preds = out[0]  # [N, 85]
-            mask = preds[:, 4] * preds[:, 5:].max(axis=1) > CONFIG["conf_threshold"]
-            preds = preds[mask]
-            if len(preds) == 0:
-                return []
-            boxes = preds[:, :4]
-            obj   = preds[:, 4]
+                if self.uses_tensor_api and hasattr(self.context, "execute_async_v3"):
+                    ok = self.context.execute_async_v3(stream_handle=self.stream.handle)
+                else:
+                    ok = self.context.execute_async_v2(
+                        bindings=self.binding_ptrs,
+                        stream_handle=self.stream.handle,
+                    )
+                if not ok:
+                    raise RuntimeError("TensorRT inference failed")
+
+                for binding in self.output_bindings:
+                    self.cuda.memcpy_dtoh_async(
+                        binding["host"],
+                        binding["device"],
+                        self.stream,
+                    )
+                self.stream.synchronize()
+                outputs = [
+                    binding["host"].reshape(binding["shape"]).copy()
+                    for binding in self.output_bindings
+                ]
+            finally:
+                self.cuda_context.pop()
+
+        return self._postprocess(outputs, h0, w0, scale, pad)
+
+    def _postprocess(
+        self,
+        outputs: list[np.ndarray],
+        orig_h: int,
+        orig_w: int,
+        scale: float,
+        pad: tuple[int, int],
+    ) -> list[dict]:
+        multi_output = self._postprocess_multi_output_nms(outputs, orig_h, orig_w, scale, pad)
+        if multi_output is not None:
+            return multi_output
+
+        out = np.asarray(outputs[0], dtype=np.float32)
+        preds = self._as_prediction_matrix(out)
+        if preds.size == 0:
+            return []
+
+        if preds.shape[1] == 6:
+            boxes_xyxy = preds[:, :4]
+            scores = preds[:, 4]
+            class_ids = preds[:, 5].astype(np.int32)
+        elif preds.shape[1] == 85:
+            obj = preds[:, 4]
             cls_probs = preds[:, 5:]
             class_ids = cls_probs.argmax(axis=1)
             scores = obj * cls_probs[np.arange(len(preds)), class_ids]
+            boxes_xyxy = xywh_to_xyxy(preds[:, :4])
+        elif preds.shape[1] >= 84:
+            cls_probs = preds[:, 4:]
+            class_ids = cls_probs.argmax(axis=1)
+            scores = cls_probs[np.arange(len(preds)), class_ids]
+            boxes_xyxy = xywh_to_xyxy(preds[:, :4])
         else:
-            preds = out[0].T  # [N, 84]
-            scores_all = preds[:, 4:]
-            class_ids  = scores_all.argmax(axis=1)
-            scores     = scores_all[np.arange(len(preds)), class_ids]
-            mask = scores > CONFIG["conf_threshold"]
-            preds, class_ids, scores = preds[mask], class_ids[mask], scores[mask]
-            if len(preds) == 0:
-                return []
-            boxes = preds[:, :4]
+            raise RuntimeError(f"Unsupported YOLO output shape: {out.shape}")
 
-        # xywh -> xyxy in original coords
-        sx, sy = w0 / self.imgsz, h0 / self.imgsz
-        x1 = (boxes[:, 0] - boxes[:, 2] / 2) * sx
-        y1 = (boxes[:, 1] - boxes[:, 3] / 2) * sy
-        x2 = (boxes[:, 0] + boxes[:, 2] / 2) * sx
-        y2 = (boxes[:, 1] + boxes[:, 3] / 2) * sy
+        mask = scores > CONFIG["conf_threshold"]
+        if not np.any(mask):
+            return []
 
-        keep = cpu_nms(np.stack([x1,y1,x2,y2], axis=1), scores, CONFIG["iou_threshold"])
+        boxes_xyxy = boxes_xyxy[mask]
+        scores = scores[mask]
+        class_ids = class_ids[mask]
+        boxes_xyxy = scale_boxes_from_engine(boxes_xyxy, orig_w, orig_h, scale, pad)
+
+        keep = cpu_nms(boxes_xyxy, scores, CONFIG["iou_threshold"])
         results = []
         for i in keep:
             cid = int(class_ids[i])
@@ -155,10 +382,134 @@ class YOLOModel:
                 "class_id":   cid,
                 "class_name": COCO_NAMES[cid] if cid < len(COCO_NAMES) else str(cid),
                 "confidence": round(float(scores[i]), 4),
-                "bbox_xyxy":  [round(float(x1[i]),1), round(float(y1[i]),1),
-                               round(float(x2[i]),1), round(float(y2[i]),1)],
+                "bbox_xyxy":  [round(float(v), 1) for v in boxes_xyxy[i]],
             })
         return results
+
+    def _as_prediction_matrix(self, out: np.ndarray) -> np.ndarray:
+        out = np.squeeze(out)
+        if out.ndim == 1:
+            out = out.reshape(1, -1)
+        if out.ndim != 2:
+            raise RuntimeError(f"Unsupported YOLO output shape: {out.shape}")
+
+        # Ultralytics YOLOv8 TensorRT exports normally return [84, N].
+        # Some engines/plugins return [N, 84] or [N, 6].
+        if out.shape[0] in (84, 85) and out.shape[1] != out.shape[0]:
+            out = out.T
+        elif out.shape[0] < out.shape[1] and out.shape[0] > 6:
+            out = out.T
+        return out
+
+    def _postprocess_multi_output_nms(
+        self,
+        outputs: list[np.ndarray],
+        orig_h: int,
+        orig_w: int,
+        scale: float,
+        pad: tuple[int, int],
+    ) -> Optional[list[dict]]:
+        if len(outputs) < 4:
+            return None
+
+        arrays = [np.asarray(o, dtype=np.float32) for o in outputs]
+        boxes_idx = next(
+            (i for i, arr in enumerate(arrays) if np.squeeze(arr).ndim >= 2 and np.squeeze(arr).shape[-1] == 4),
+            None,
+        )
+        if boxes_idx is None:
+            return None
+
+        boxes = np.squeeze(arrays[boxes_idx]).reshape(-1, 4)
+        count = len(boxes)
+        scalar_counts = [
+            int(np.ravel(arr)[0])
+            for i, arr in enumerate(arrays)
+            if i != boxes_idx and np.ravel(arr).size == 1
+        ]
+        if scalar_counts:
+            count = min(count, max(0, scalar_counts[0]))
+        if count == 0:
+            return []
+
+        candidates = []
+        for i, arr in enumerate(arrays):
+            if i == boxes_idx or np.ravel(arr).size == 1:
+                continue
+            flat = np.squeeze(arr).reshape(-1)
+            if len(flat) >= count:
+                candidates.append((i, flat[:count]))
+        if len(candidates) < 2:
+            return None
+
+        names = [b["name"].lower() for b in self.output_bindings]
+        named_score_idx = next(
+            (i for i, _ in candidates if "score" in names[i] or "conf" in names[i]),
+            None,
+        )
+        named_class_idx = next(
+            (i for i, _ in candidates if "class" in names[i] or "label" in names[i]),
+            None,
+        )
+
+        if named_score_idx is not None and named_class_idx is not None:
+            scores = next(values for i, values in candidates if i == named_score_idx)
+            class_ids = next(values for i, values in candidates if i == named_class_idx).astype(np.int32)
+        else:
+            score_candidates = [
+                item for item in candidates
+                if np.nanmin(item[1]) >= 0.0 and np.nanmax(item[1]) <= 1.0
+            ]
+            score_idx, scores = score_candidates[0] if score_candidates else candidates[0]
+            class_candidates = [item for item in candidates if item[0] != score_idx]
+            class_ids = class_candidates[0][1].astype(np.int32)
+
+        boxes = boxes[:count]
+        scores = scores[:count]
+        mask = scores > CONFIG["conf_threshold"]
+        if not np.any(mask):
+            return []
+
+        boxes = scale_boxes_from_engine(boxes[mask], orig_w, orig_h, scale, pad)
+        scores = scores[mask]
+        class_ids = class_ids[mask]
+        keep = cpu_nms(boxes, scores, CONFIG["iou_threshold"])
+
+        results = []
+        for i in keep:
+            cid = int(class_ids[i])
+            results.append({
+                "class_id":   cid,
+                "class_name": COCO_NAMES[cid] if cid < len(COCO_NAMES) else str(cid),
+                "confidence": round(float(scores[i]), 4),
+                "bbox_xyxy":  [round(float(v), 1) for v in boxes[i]],
+            })
+        return results
+
+
+def xywh_to_xyxy(boxes: np.ndarray) -> np.ndarray:
+    boxes = boxes.astype(np.float32, copy=False)
+    x1 = boxes[:, 0] - boxes[:, 2] / 2
+    y1 = boxes[:, 1] - boxes[:, 3] / 2
+    x2 = boxes[:, 0] + boxes[:, 2] / 2
+    y2 = boxes[:, 1] + boxes[:, 3] / 2
+    return np.stack([x1, y1, x2, y2], axis=1)
+
+
+def scale_boxes_from_engine(
+    boxes: np.ndarray,
+    orig_w: int,
+    orig_h: int,
+    scale: float,
+    pad: tuple[int, int],
+) -> np.ndarray:
+    pad_x, pad_y = pad
+    boxes = boxes.astype(np.float32, copy=True)
+    boxes[:, [0, 2]] = (boxes[:, [0, 2]] - pad_x) / scale
+    boxes[:, [1, 3]] = (boxes[:, [1, 3]] - pad_y) / scale
+    boxes[:, [0, 2]] = np.clip(boxes[:, [0, 2]], 0, orig_w - 1)
+    boxes[:, [1, 3]] = np.clip(boxes[:, [1, 3]], 0, orig_h - 1)
+    return boxes
 
 
 def cpu_nms(boxes, scores, iou_thresh):
@@ -336,7 +687,7 @@ def pipeline_loop(cam_id: str, source: str, model: YOLOModel):
 
 
 # ─────────────────────────── FastAPI ──────────────────────────────────────────
-app = FastAPI(title="Multi-Cam YOLO ONNX", version="2.0")
+app = FastAPI(title="Multi-Cam YOLO TensorRT", version="2.0")
 MJPEG_DELAY = 1.0 / CONFIG["mjpeg_fps"]
 
 
@@ -643,7 +994,7 @@ def root():
         for i in range(1, 6)
     )
     return HTMLResponse(f"""<html><body style="background:#111;color:#eee;font-family:monospace;padding:24px;">
-<h2 style="color:#0f0">Multi-Cam YOLO ONNX Server</h2>
+<h2 style="color:#0f0">Multi-Cam YOLO TensorRT Server</h2>
 <ul>{links}
 <li><a href="/log/live" style="color:#f80">/log/live</a> — Central log (all cameras)</li>
 <li><a href="/detections">/detections</a> — JSON API</li>
