@@ -46,7 +46,7 @@ Configured in `config.py` under `CONFIG["deepstream"]`:
 
 ```text
 ONNX model:        models/pipeline_beta/yolov8n(1).onnx
-Engine output:     models/pipeline_beta/yolov8n_deepstream_nano_b5_fp32.engine
+Engine output:     model_b5_gpu0_fp32.engine
 Labels:            configs/deepstream/labels_coco.txt
 YOLO parser .so:   /opt/nvidia/deepstream/deepstream-6.0/sources/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 Primary GIE ref:   configs/deepstream/primary_gie_yolov8n_nano.txt

@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 YOLO_ONNX="${YOLO_ONNX:-${PROJECT_ROOT}/models/pipeline_beta/yolov8n(1).onnx}"
-YOLO_ENGINE="${YOLO_ENGINE:-${PROJECT_ROOT}/models/pipeline_beta/yolov8n_deepstream_nano_b5_fp32.engine}"
+YOLO_ENGINE="${YOLO_ENGINE:-${PROJECT_ROOT}/model_b5_gpu0_fp32.engine}"
 BRAND_ONNX="${BRAND_ONNX:-${SCRIPT_DIR}/exports/efficientnetb0_brand_opset12.onnx}"
 BRAND_ENGINE="${BRAND_ENGINE:-${SCRIPT_DIR}/exports/efficientnetb0_brand_fp32.engine}"
 YOLO_BATCH="${YOLO_BATCH:-5}"
