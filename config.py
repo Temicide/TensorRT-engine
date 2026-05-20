@@ -11,7 +11,7 @@ CONFIG = {
     "conf_threshold": 0.25,
     "iou_threshold":  0.45,
     "imgsz":          640,
-    "mjpeg_fps":      20,
+    "mjpeg_fps":      8,
     "host":           "0.0.0.0",
     "port":           8000,
     "jetson_id":      "jetson-nano-01",
@@ -22,9 +22,8 @@ CONFIG = {
     # startup stops instead of silently falling back to CPU inference.
     "gpu_required":   True,
 
-    # Start conservatively on Jetson Nano: one RTSP stream, batch-size=1.
-    # Multi-stream can be added after one stream is stable.
-    "active_cameras": ["cam1"],
+    # Cameras to start. Keep deepstream.batch_size equal to this count.
+    "active_cameras": ["cam1", "cam2", "cam3", "cam4", "cam5"],
 
     "cameras": {
         "cam1": "rtsp://10.0.11.153:8554/mock1",
@@ -47,7 +46,7 @@ CONFIG = {
         # Must be a raw YOLO detector export. Do not use an ONNX with NMS,
         # TopK, or Mod post-processing baked into the graph.
         "onnx_model_path": "models/pipeline_beta/yolov8n(1).onnx",
-        "engine_path": "models/pipeline_beta/yolov8n_deepstream_nano_b1_fp32.engine",
+        "engine_path": "models/pipeline_beta/yolov8n_deepstream_nano_b5_fp32.engine",
         "labels_path": "configs/deepstream/labels_coco.txt",
         "custom_parser_path": "/opt/nvidia/deepstream/deepstream-6.0/sources/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so",
         "primary_gie_config_path": "configs/deepstream/primary_gie_yolov8n_nano.txt",
@@ -55,7 +54,7 @@ CONFIG = {
         # nvinfer settings. Start with FP32 on Nano; try network-mode=2 only
         # after FP32 works end to end.
         "network_mode": 0,  # 0=FP32, 1=INT8, 2=FP16
-        "batch_size": 1,
+        "batch_size": 5,
         "gpu_id": 0,
         "num_detected_classes": 80,
         "input_width": 640,
@@ -80,8 +79,8 @@ CONFIG = {
         # Sink options: fakesink, egl, appsink. appsink preserves the existing
         # MJPEG endpoint but copies frames to CPU and costs Nano CPU time.
         "display": False,
-        "sink_type": "fakesink",
-        "enable_mjpeg_output": False,
+        "sink_type": "appsink",
+        "enable_mjpeg_output": True,
         "jpeg_quality": 70,
     },
 }

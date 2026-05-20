@@ -39,12 +39,17 @@ def cam_live_html(cam_id):
 <script>
 const src = new EventSource('/{cam_id}/stream');
 const logEl = document.getElementById('log');
+let sawFrame = false;
 src.onmessage = e => {{
   const r = JSON.parse(e.data);
   document.getElementById('fps').textContent = r.fps?.toFixed(1) ?? '—';
   document.getElementById('lat').textContent = r.latency_ms ?? '—';
   document.getElementById('dets').textContent = r.num_detections ?? 0;
   document.getElementById('frm').textContent = r.frame ?? '—';
+  if (!sawFrame && r.frame !== undefined) {{
+    sawFrame = true;
+    logEl.innerHTML = '<em>Stream active. No detections yet.</em>';
+  }}
   if (r.num_detections > 0) {{
     const div = document.createElement('div');
     div.className = 'row';

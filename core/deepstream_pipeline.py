@@ -4,7 +4,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from config import CONFIG
 from core.deepstream_config import (
@@ -68,6 +68,7 @@ class DeepStreamPipeline:
             for cid in self.cam_ids
         }
         self.frame_seen_at: Dict[str, float] = {}
+        self.last_mjpeg_at: Dict[str, float] = {}
         self.pipeline = None
         self.mainloop = None
         self.loop_thread: Optional[threading.Thread] = None
@@ -265,24 +266,73 @@ class DeepStreamPipeline:
             return [transform, sink]
 
         if sink_type == "appsink":
-            convert = self._make("nvvideoconvert", "appsink-convert")
-            capsfilter = self._make("capsfilter", "appsink-caps")
-            appsink = self._make("appsink", "appsink")
-            caps = self.Gst.Caps.from_string("video/x-raw,format=RGBA")
-            capsfilter.set_property("caps", caps)
-            appsink.set_property("emit-signals", True)
-            appsink.set_property("sync", False)
-            appsink.set_property("drop", True)
-            appsink.set_property("max-buffers", 1)
-            appsink.connect("new-sample", self._on_new_sample)
-            self.pipeline.add(convert)
-            self.pipeline.add(capsfilter)
-            self.pipeline.add(appsink)
-            return [convert, capsfilter, appsink]
+            if len(self.cam_ids) > 1:
+                return self._add_demuxed_appsink_branch()
+            return self._add_single_appsink_branch()
 
         raise DeepStreamConfigError(
             f"Unsupported DeepStream sink_type '{sink_type}'. Use fakesink, egl, or appsink."
         )
+
+    def _add_single_appsink_branch(self) -> List[object]:
+        convert, capsfilter, appsink = self._make_appsink_elements("appsink", self.cam_ids[0])
+        self.pipeline.add(convert)
+        self.pipeline.add(capsfilter)
+        self.pipeline.add(appsink)
+        return [convert, capsfilter, appsink]
+
+    def _add_demuxed_appsink_branch(self) -> List[object]:
+        """Split batched DeepStream output so each active camera has MJPEG frames."""
+        demux = self._make("nvstreamdemux", "stream-demuxer")
+        self.pipeline.add(demux)
+
+        for index, cam_id in enumerate(self.cam_ids):
+            queue = self._make("queue", f"appsink-queue-{index}")
+            queue.set_property("leaky", 2)
+            queue.set_property("max-size-buffers", 1)
+            queue.set_property("max-size-bytes", 0)
+            queue.set_property("max-size-time", 0)
+
+            convert, capsfilter, appsink = self._make_appsink_elements(f"appsink-{index}", cam_id)
+
+            for element in (queue, convert, capsfilter, appsink):
+                self.pipeline.add(element)
+
+            if not queue.link(convert):
+                raise DeepStreamConfigError(f"Failed to link appsink queue -> converter for {cam_id}")
+            if not convert.link(capsfilter):
+                raise DeepStreamConfigError(f"Failed to link appsink converter -> caps for {cam_id}")
+            if not capsfilter.link(appsink):
+                raise DeepStreamConfigError(f"Failed to link appsink caps -> sink for {cam_id}")
+
+            srcpad = self._request_demux_src_pad(demux, index, cam_id)
+            sinkpad = queue.get_static_pad("sink")
+            if sinkpad is None:
+                raise DeepStreamConfigError(f"Could not get appsink queue sink pad for {cam_id}")
+            if srcpad.link(sinkpad) != self.Gst.PadLinkReturn.OK:
+                raise DeepStreamConfigError(f"Failed to link demux src_{index} -> appsink branch for {cam_id}")
+
+        return [demux]
+
+    def _make_appsink_elements(self, name_prefix: str, cam_id: str) -> Tuple[object, object, object]:
+        convert = self._make("nvvideoconvert", f"{name_prefix}-convert")
+        capsfilter = self._make("capsfilter", f"{name_prefix}-caps")
+        appsink = self._make("appsink", f"{name_prefix}-sink")
+        caps = self.Gst.Caps.from_string("video/x-raw,format=RGBA")
+        capsfilter.set_property("caps", caps)
+        appsink.set_property("emit-signals", True)
+        appsink.set_property("sync", False)
+        appsink.set_property("drop", True)
+        appsink.set_property("max-buffers", 1)
+        appsink.connect("new-sample", self._on_new_sample, cam_id)
+        return convert, capsfilter, appsink
+
+    def _request_demux_src_pad(self, demux, index: int, cam_id: str):
+        for pad_name in (f"src_{index}", "src_%u"):
+            pad = demux.get_request_pad(pad_name)
+            if pad is not None:
+                return pad
+        raise DeepStreamConfigError(f"Could not request nvstreamdemux src pad for {cam_id}")
 
     def _configure_tracker(self, tracker) -> None:
         config_path = Path(resolve_project_path(str(self.ds.get("tracker_config_path") or "")))
@@ -437,16 +487,28 @@ class DeepStreamPipeline:
         if detections:
             push_external_async(cam_id, record)
 
-    def _on_new_sample(self, sink):
+    def _on_new_sample(self, sink, cam_id: Optional[str] = None):
         sample = sink.emit("pull-sample")
         if sample is None:
             return self.Gst.FlowReturn.OK
 
         if not bool(self.ds.get("enable_mjpeg_output", False)):
             return self.Gst.FlowReturn.OK
-        if len(self.cam_ids) != 1:
-            log.warning("appsink MJPEG output is only enabled for one active stream.")
+        if cam_id is None:
+            if len(self.cam_ids) != 1:
+                log.warning("appsink MJPEG sample did not include a camera id.")
+                return self.Gst.FlowReturn.OK
+            cam_id = self.cam_ids[0]
+        if cam_id not in cam_state:
             return self.Gst.FlowReturn.OK
+
+        max_fps = float(CONFIG.get("mjpeg_fps", 0) or 0)
+        if max_fps > 0:
+            now = time.time()
+            previous = self.last_mjpeg_at.get(cam_id, 0.0)
+            if now - previous < 1.0 / max_fps:
+                return self.Gst.FlowReturn.OK
+            self.last_mjpeg_at[cam_id] = now
 
         buffer = sample.get_buffer()
         caps = sample.get_caps()
@@ -474,7 +536,6 @@ class DeepStreamPipeline:
             quality = int(self.ds.get("jpeg_quality", 70))
             ok, jpg = cv2.imencode(".jpg", frame_bgr, [cv2.IMWRITE_JPEG_QUALITY, quality])
             if ok:
-                cam_id = self.cam_ids[0]
                 state = cam_state[cam_id]
                 with state["lock"]:
                     state["frame_jpg"] = jpg.tobytes()

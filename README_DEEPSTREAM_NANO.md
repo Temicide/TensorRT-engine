@@ -11,7 +11,7 @@ RTSP source
   -> optional nvtracker
   -> nvvideoconvert
   -> nvdsosd
-  -> sink
+  -> sink or nvstreamdemux -> per-camera appsink
 ```
 
 The old OpenCV capture and manual PyCUDA/TensorRT inference modules remain only
@@ -26,7 +26,8 @@ Use conservative Jetson Nano assumptions:
 - JetPack 4.6.x.
 - DeepStream 6.0 or 6.0.1.
 - CUDA 10.2 on standard JetPack 4.6.x.
-- Batch size 1 and one RTSP stream until the pipeline is validated.
+- Batch size must match the active camera count. Use one stream for debugging;
+  the checked-in config starts five configured RTSP streams.
 - Start with FP32 (`network-mode=0`). Try FP16 (`network-mode=2`) only after FP32 works.
 
 ## Current Vanilla Pipeline That Was Replaced
@@ -44,8 +45,8 @@ probe over DeepStream metadata instead of raw Python inference results.
 Configured in `config.py` under `CONFIG["deepstream"]`:
 
 ```text
-ONNX model:        models/pipeline_1/exports/yolo26n_opset12.onnx
-Engine output:     models/pipeline_1/exports/yolo26n_deepstream_nano_b1_fp32.engine
+ONNX model:        models/pipeline_beta/yolov8n(1).onnx
+Engine output:     models/pipeline_beta/yolov8n_deepstream_nano_b5_fp32.engine
 Labels:            configs/deepstream/labels_coco.txt
 YOLO parser .so:   /opt/nvidia/deepstream/deepstream-6.0/sources/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 Primary GIE ref:   configs/deepstream/primary_gie_yolov8n_nano.txt
@@ -225,14 +226,15 @@ assuming a large speedup.
 
 Edit `config.py`:
 
-- `active_cameras`: keep `["cam1"]` for first validation.
-- `cameras["cam1"]`: set your RTSP URI.
+- `active_cameras`: set the cameras to start, for example all configured
+  cameras or only `["cam1"]` while debugging.
+- `cameras`: set each RTSP URI.
 - `deepstream.onnx_model_path`
 - `deepstream.engine_path`
 - `deepstream.labels_path`
 - `deepstream.custom_parser_path`
 - `deepstream.input_width` / `input_height`
-- `deepstream.batch_size`
+- `deepstream.batch_size`: must match `len(active_cameras)`.
 - `deepstream.workspace_size`
 - `deepstream.sink_type`: `fakesink`, `egl`, or `appsink`
 - `deepstream.enable_mjpeg_output`: only true with `sink_type="appsink"`
