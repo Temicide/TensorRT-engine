@@ -239,7 +239,7 @@ def _config_lines(ds: Dict[str, object]) -> Iterable[str]:
     yield "gie-unique-id=1"
     yield f"interval={int(ds.get('interval', 0))}"
     yield f"workspace-size={int(ds.get('workspace_size', 1024))}"
-    yield "cluster-mode=2"
+    yield "cluster-mode=4"
     yield "maintain-aspect-ratio=1"
     yield "symmetric-padding=1"
     yield f"infer-dims=3;{input_height};{input_width}"
