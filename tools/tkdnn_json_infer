@@ -28,10 +28,15 @@ def parse_args():
     parser.add_argument("--cfg", default="", help="Accepted for compatibility with the FastAPI adapter.")
     parser.add_argument("--weights", default="", help="Accepted for compatibility with the FastAPI adapter.")
     parser.add_argument("--names", required=True, help="Path to class names file.")
-    parser.add_argument("--image", required=True, help="Path to input image.")
+    parser.add_argument("--image", default="", help="Path to input image.")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold.")
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold.")
     parser.add_argument("--tkdnn-build", default=os.environ.get("TKDNN_BUILD", DEFAULT_TKDNN_BUILD))
+    parser.add_argument(
+        "--server",
+        action="store_true",
+        help="Keep TensorRT loaded and read JSON requests from stdin, one per line.",
+    )
     return parser.parse_args()
 
 
@@ -60,68 +65,109 @@ def preprocess(image):
     return np.ascontiguousarray(nchw)
 
 
-def run_tensorrt(rt_path, tensor):
-    import pycuda.autoinit  # noqa: F401
-    import pycuda.driver as cuda
-    import tensorrt as trt
+class TensorRTYoloRunner:
+    def __init__(self, rt_path, input_shape=(1, 3, INPUT_SIZE, INPUT_SIZE)):
+        import pycuda.autoinit  # noqa: F401
+        import pycuda.driver as cuda
+        import tensorrt as trt
 
-    logger = trt.Logger(trt.Logger.ERROR)
-    trt.init_libnvinfer_plugins(logger, "")
-    with open(rt_path, "rb") as engine_file:
-        engine_bytes = engine_file.read()
+        self.cuda = cuda
+        self.trt = trt
+        self.batch_size = int(input_shape[0])
 
-    runtime = trt.Runtime(logger)
-    engine = runtime.deserialize_cuda_engine(engine_bytes)
-    if engine is None:
-        raise RuntimeError("Could not deserialize tkDNN .rt file: {}".format(rt_path))
+        logger = trt.Logger(trt.Logger.ERROR)
+        trt.init_libnvinfer_plugins(logger, "")
+        with open(rt_path, "rb") as engine_file:
+            engine_bytes = engine_file.read()
 
-    context = engine.create_execution_context()
-    if context is None:
-        raise RuntimeError("Could not create TensorRT execution context")
+        self.runtime = trt.Runtime(logger)
+        self.engine = self.runtime.deserialize_cuda_engine(engine_bytes)
+        if self.engine is None:
+            raise RuntimeError("Could not deserialize tkDNN .rt file: {}".format(rt_path))
 
-    batch_size = int(tensor.shape[0])
-    implicit_batch = bool(getattr(engine, "has_implicit_batch_dimension", False))
-    bindings = [0] * engine.num_bindings
-    allocations = []
-    outputs = []
+        self.context = self.engine.create_execution_context()
+        if self.context is None:
+            raise RuntimeError("Could not create TensorRT execution context")
 
-    for idx in range(engine.num_bindings):
-        shape = tuple(int(dim) for dim in engine.get_binding_shape(idx))
-        dtype = trt.nptype(engine.get_binding_dtype(idx))
+        self.implicit_batch = bool(getattr(self.engine, "has_implicit_batch_dimension", False))
+        self.bindings = [0] * self.engine.num_bindings
+        self.outputs = []
+        self.input_device = None
+        self.input_dtype = None
+        self.input_nbytes = None
 
-        if engine.binding_is_input(idx):
-            host = np.ascontiguousarray(tensor.astype(dtype, copy=False))
+        self._allocate_bindings(input_shape)
+        self.stream = cuda.Stream()
+
+    def _binding_shape(self, idx):
+        if hasattr(self.context, "get_binding_shape"):
+            shape = self.context.get_binding_shape(idx)
         else:
-            output_shape = (batch_size,) + shape if implicit_batch else shape
+            shape = self.engine.get_binding_shape(idx)
+        return tuple(int(dim) for dim in shape)
+
+    def _allocate_bindings(self, input_shape):
+        for idx in range(self.engine.num_bindings):
+            shape = tuple(int(dim) for dim in self.engine.get_binding_shape(idx))
+            dtype = self.trt.nptype(self.engine.get_binding_dtype(idx))
+
+            if self.engine.binding_is_input(idx):
+                if not self.implicit_batch and any(dim < 0 for dim in shape):
+                    self.context.set_binding_shape(idx, tuple(input_shape))
+                    shape = self._binding_shape(idx)
+                host = np.empty(input_shape, dtype=dtype)
+                self.input_dtype = dtype
+                self.input_nbytes = host.nbytes
+                self.input_device = self.cuda.mem_alloc(host.nbytes)
+                self.bindings[idx] = int(self.input_device)
+                continue
+
+            if any(dim < 0 for dim in shape):
+                shape = self._binding_shape(idx)
+            output_shape = (self.batch_size,) + shape if self.implicit_batch else shape
             size = int(np.prod(output_shape))
-            host = cuda.pagelocked_empty(size, dtype)
-            outputs.append((idx, output_shape, host))
+            host = self.cuda.pagelocked_empty(size, dtype)
+            device = self.cuda.mem_alloc(host.nbytes)
+            self.bindings[idx] = int(device)
+            self.outputs.append((output_shape, host, device))
 
-        device = cuda.mem_alloc(host.nbytes)
-        bindings[idx] = int(device)
-        allocations.append((idx, host, device))
+        if self.input_device is None:
+            raise RuntimeError("TensorRT engine has no input binding")
 
-    stream = cuda.Stream()
-    for idx, host, device in allocations:
-        if engine.binding_is_input(idx):
-            cuda.memcpy_htod_async(device, host, stream)
+    def infer(self, tensor):
+        tensor = np.ascontiguousarray(tensor.astype(self.input_dtype, copy=False))
+        if tensor.nbytes != self.input_nbytes:
+            raise RuntimeError(
+                "Unexpected input tensor size: got {} bytes, expected {}".format(
+                    tensor.nbytes,
+                    self.input_nbytes,
+                )
+            )
 
-    if implicit_batch:
-        ok = context.execute_async(batch_size=batch_size, bindings=bindings, stream_handle=stream.handle)
-    else:
-        ok = context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
-    if not ok:
-        raise RuntimeError("TensorRT execution failed")
+        self.cuda.memcpy_htod_async(self.input_device, tensor, self.stream)
+        if self.implicit_batch:
+            ok = self.context.execute_async(
+                batch_size=int(tensor.shape[0]),
+                bindings=self.bindings,
+                stream_handle=self.stream.handle,
+            )
+        else:
+            ok = self.context.execute_async_v2(bindings=self.bindings, stream_handle=self.stream.handle)
+        if not ok:
+            raise RuntimeError("TensorRT execution failed")
 
-    for idx, host, device in allocations:
-        if not engine.binding_is_input(idx):
-            cuda.memcpy_dtoh_async(host, device, stream)
-    stream.synchronize()
+        for _, host, device in self.outputs:
+            self.cuda.memcpy_dtoh_async(host, device, self.stream)
+        self.stream.synchronize()
 
-    tensors = []
-    for _, shape, host in outputs:
-        tensors.append(np.array(host).reshape(shape))
-    return tensors
+        tensors = []
+        for shape, host, _ in self.outputs:
+            tensors.append(np.array(host).reshape(shape))
+        return tensors
+
+
+def run_tensorrt(rt_path, tensor):
+    return TensorRTYoloRunner(rt_path, input_shape=tensor.shape).infer(tensor)
 
 
 def decode_yolov4_tiny(outputs, orig_w, orig_h, conf_thresh):
@@ -219,22 +265,14 @@ def nms(detections, iou_thresh):
     return kept
 
 
-def main():
-    args = parse_args()
-    rt_path = Path(args.rt)
-    if not rt_path.is_file():
-        raise RuntimeError("tkDNN .rt file does not exist: {}".format(rt_path))
-
-    image = cv2.imread(args.image)
+def infer_image(runner, names, image_path, conf_thresh, iou_thresh):
+    image = cv2.imread(image_path)
     if image is None:
-        raise RuntimeError("Could not read image: {}".format(args.image))
-
-    names = load_names(args.names)
-    load_tkdnn_plugins(args.tkdnn_build)
+        raise RuntimeError("Could not read image: {}".format(image_path))
 
     tensor = preprocess(image)
-    outputs = run_tensorrt(str(rt_path), tensor)
-    detections = nms(decode_yolov4_tiny(outputs, image.shape[1], image.shape[0], args.conf), args.iou)
+    outputs = runner.infer(tensor)
+    detections = nms(decode_yolov4_tiny(outputs, image.shape[1], image.shape[0], conf_thresh), iou_thresh)
 
     payload = []
     for class_id, confidence, bbox in detections:
@@ -253,7 +291,50 @@ def main():
                 ],
             }
         )
+    return payload
 
+
+def serve_requests(runner, names, default_conf, default_iou):
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            request = json.loads(line)
+            image_path = request.get("image", "")
+            if not image_path:
+                raise RuntimeError("Request missing image path")
+
+            conf_thresh = float(request.get("conf", default_conf))
+            iou_thresh = float(request.get("iou", default_iou))
+            detections = infer_image(runner, names, image_path, conf_thresh, iou_thresh)
+            response = {"ok": True, "detections": detections}
+        except Exception as exc:
+            response = {"ok": False, "error": str(exc)}
+
+        print(json.dumps(response, separators=(",", ":")), flush=True)
+
+
+def main():
+    args = parse_args()
+    rt_path = Path(args.rt)
+    if not rt_path.is_file():
+        raise RuntimeError("tkDNN .rt file does not exist: {}".format(rt_path))
+
+    if not args.server and not args.image:
+        raise RuntimeError("--image is required unless --server is used")
+
+    names = load_names(args.names)
+    load_tkdnn_plugins(args.tkdnn_build)
+    runner = TensorRTYoloRunner(str(rt_path))
+
+    if args.server:
+        print("tkdnn_json_infer server ready", file=sys.stderr, flush=True)
+        serve_requests(runner, names, args.conf, args.iou)
+        return
+
+    payload = infer_image(runner, names, args.image, args.conf, args.iou)
     print(json.dumps(payload, separators=(",", ":")))
 
 

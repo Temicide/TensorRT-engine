@@ -39,10 +39,10 @@ CONFIG = {
         "weights": "models/pipeline_2/darknet/yolov4-tiny.weights",
         "names": "models/pipeline_2/darknet/coco.names",
         "rt": "/home/ta/tkDNN/build/yolo4tiny_fp16.rt",
-        "bridge_mode": "image_command",
+        "bridge_mode": "persistent_command",
         "command": "/home/ta/hardteam_ws/tensorrt/chi_ws/tools/tkdnn_json_infer",
-        # The bundled Python bridge starts PyCUDA/TensorRT and loads the .rt file
-        # per call, which can exceed 2s on Jetson Nano even when inference works.
+        # persistent_command keeps PyCUDA/TensorRT and the .rt file loaded.
+        # The first request may still include one-time TensorRT startup cost.
         "timeout_sec": 15.0,
     },
 

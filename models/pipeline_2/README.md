@@ -119,6 +119,7 @@ The server is configured through `config.py`:
     "cfg": "models/pipeline_2/darknet/yolov4-tiny.cfg",
     "weights": "models/pipeline_2/darknet/yolov4-tiny.weights",
     "names": "models/pipeline_2/darknet/coco.names",
+    "bridge_mode": "persistent_command",
     "command": "/path/to/tkdnn_json_infer",
     "timeout_sec": 15.0,
 }
@@ -146,10 +147,11 @@ Expected stdout:
 [{"class_id":2,"class_name":"car","confidence":0.91,"bbox_xyxy":[10,20,120,220]}]
 ```
 
-Time the bridge manually on Jetson Nano before enabling all cameras. The
-bundled Python bridge starts PyCUDA/TensorRT and loads the `.rt` engine per
-call, so `timeout_sec` must be above the measured runtime. A persistent/native
-bridge is required for reasonable multi-camera FPS.
+The FastAPI server uses `bridge_mode="persistent_command"` by default. It
+starts `tkdnn_json_infer --server` once, keeps PyCUDA/TensorRT and the `.rt`
+engine loaded, then sends frame requests over stdin/stdout. If the first
+request times out, raise `timeout_sec`; after startup, steady-state frames
+should be much faster than a manual single-shot run.
 
 Until that bridge exists, startup will fail with a clear configuration error.
 To return to the previous Python TensorRT engine workflow, set:

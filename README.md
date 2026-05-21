@@ -176,6 +176,7 @@ Then edit `config.py`:
 
 ```python
 "tkdnn": {
+    "bridge_mode": "persistent_command",
     "command": "/path/to/tkdnn_json_infer",
     "timeout_sec": 15.0,
 }
@@ -184,7 +185,8 @@ Then edit `config.py`:
 Keep the existing `cfg`, `weights`, and `names` paths unless you moved the
 model files.
 
-On Jetson Nano, time one manual bridge run before starting all cameras:
+On Jetson Nano, test one manual single-shot bridge run before starting all
+cameras:
 
 ```bash
 time /path/to/tkdnn_json_infer \
@@ -197,10 +199,11 @@ time /path/to/tkdnn_json_infer \
   --iou 0.45
 ```
 
-Set `CONFIG["tkdnn"]["timeout_sec"]` above that measured runtime. The bundled
-Python bridge cold-starts PyCUDA/TensorRT and loads the `.rt` file for each
-frame, so a 2 second timeout is usually too low on Nano. For real multi-camera
-FPS, replace it with a persistent/native bridge that keeps the engine loaded.
+The server uses `bridge_mode="persistent_command"` by default. That starts
+`tkdnn_json_infer --server` once, keeps PyCUDA/TensorRT and the `.rt` file
+loaded, then sends frame requests over stdin/stdout. If the first request times
+out, raise `CONFIG["tkdnn"]["timeout_sec"]`; after startup, steady-state frames
+should be much faster than the manual single-shot runtime.
 
 ## 7. Configure Cameras
 
@@ -277,10 +280,11 @@ If startup says `CONFIG["tkdnn"]["command"]` is empty, tkDNN is not connected to
 the Python server yet. Build/provide the `tkdnn_json_infer` executable and set
 its path in `config.py`.
 
-If logs say `tkDNN bridge timed out after ...`, run the manual `time
-/path/to/tkdnn_json_infer ...` command above and raise
-`CONFIG["tkdnn"]["timeout_sec"]` above the measured runtime. Keep
-`"active_cameras": ["cam1"]` until a single camera returns detections.
+If logs say `tkDNN persistent bridge timed out after ...`, keep
+`"active_cameras": ["cam1"]` and raise `CONFIG["tkdnn"]["timeout_sec"]` for the
+first request. If logs say the bridge exited, read the captured stderr in the
+same log line; it usually identifies a TensorRT, PyCUDA, `.rt`, or plugin-load
+problem.
 
 If RTSP capture is unstable, keep this in `config.py`:
 
