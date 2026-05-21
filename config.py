@@ -26,11 +26,11 @@ CONFIG = {
     "active_cameras": ["cam1"],
 
     "cameras": {
-        "cam1": "rtsp://10.0.11.153:8554/mock1",
-        "cam2": "rtsp://10.0.11.153:8554/mock5",
-        "cam3": "rtsp://10.0.11.153:8554/mock9",
-        "cam4": "rtsp://10.0.11.153:8554/cctv08",
-        "cam5": "rtsp://10.0.11.153:8554/cctv09",
+        "cam1": "rtsp://10.0.11.153:8000/mock1",
+        "cam2": "rtsp://10.0.11.153:8000/mock5",
+        "cam3": "rtsp://10.0.11.153:8000/mock9",
+        "cam4": "rtsp://10.0.11.153:8000/cctv08",
+        "cam5": "rtsp://10.0.11.153:8000/cctv09",
     },
 
     "deepstream": {
