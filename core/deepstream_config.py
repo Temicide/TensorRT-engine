@@ -245,7 +245,7 @@ def _config_lines(ds: Dict[str, object]) -> Iterable[str]:
     yield f"infer-dims=3;{input_height};{input_width}"
     yield "net-scale-factor=0.0039215697906911373"
     yield "model-color-format=0"
-    yield "parse-bbox-func-name=NvDsInferParseYoloV8"
+    yield "parse-bbox-func-name=NvDsInferParseYolo"
     yield f"custom-lib-path={resolve_project_path(str(ds['custom_parser_path']))}"
     if engine_create_func:
         yield f"engine-create-func-name={engine_create_func}"
