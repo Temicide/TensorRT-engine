@@ -15,6 +15,7 @@ DEFAULT_RT = "/home/ta/tkDNN/build/yolo4tiny_fp16.rt"
 DEFAULT_TKDNN_BUILD = "/home/ta/tkDNN/build"
 INPUT_SIZE = 416
 NUM_CLASSES = 80
+DEFAULT_MAX_DETECTIONS = 50
 ANCHORS = [(10, 14), (23, 27), (37, 58), (81, 82), (135, 169), (344, 319)]
 MASKS_BY_GRID = {
     13: [3, 4, 5],
@@ -31,6 +32,7 @@ def parse_args():
     parser.add_argument("--image", default="", help="Path to input image.")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold.")
     parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold.")
+    parser.add_argument("--max-detections", type=int, default=DEFAULT_MAX_DETECTIONS)
     parser.add_argument("--tkdnn-build", default=os.environ.get("TKDNN_BUILD", DEFAULT_TKDNN_BUILD))
     parser.add_argument(
         "--server",
@@ -50,6 +52,14 @@ def load_tkdnn_plugins(tkdnn_build):
 
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
+
+
+def yolo_activation(values):
+    arr = np.asarray(values)
+    finite = arr[np.isfinite(arr)]
+    if finite.size and finite.min() >= -1e-4 and finite.max() <= 1.0001:
+        return np.clip(arr, 0.0, 1.0)
+    return sigmoid(arr)
 
 
 def load_names(path):
@@ -172,6 +182,7 @@ def run_tensorrt(rt_path, tensor):
 
 def decode_yolov4_tiny(outputs, orig_w, orig_h, conf_thresh):
     decoded = []
+    min_objectness = max(0.5, conf_thresh)
 
     for output in outputs:
         arr = np.asarray(output)
@@ -199,19 +210,22 @@ def decode_yolov4_tiny(outputs, orig_w, orig_h, conf_thresh):
             ty = values[1]
             tw = values[2]
             th = values[3]
-            objectness = sigmoid(values[4])
-            class_scores = sigmoid(values[5 : 5 + classes])
+            objectness = yolo_activation(values[4])
+            class_scores = yolo_activation(values[5 : 5 + classes])
 
             best_class = np.argmax(class_scores, axis=0)
             best_score = np.max(class_scores, axis=0)
             confidence = objectness * best_score
-            ys, xs = np.where(confidence >= conf_thresh)
+            ys, xs = np.where((confidence > conf_thresh) & (objectness > min_objectness))
+
+            tx_act = yolo_activation(tx)
+            ty_act = yolo_activation(ty)
 
             for y, x in zip(ys, xs):
                 conf = float(confidence[y, x])
                 cls = int(best_class[y, x])
-                bx = (float(sigmoid(tx[y, x])) + x) / grid_w * INPUT_SIZE
-                by = (float(sigmoid(ty[y, x])) + y) / grid_h * INPUT_SIZE
+                bx = (float(tx_act[y, x]) + x) / grid_w * INPUT_SIZE
+                by = (float(ty_act[y, x]) + y) / grid_h * INPUT_SIZE
                 bw = math.exp(float(np.clip(tw[y, x], -10.0, 10.0))) * anchor_w
                 bh = math.exp(float(np.clip(th[y, x], -10.0, 10.0))) * anchor_h
 
@@ -265,7 +279,7 @@ def nms(detections, iou_thresh):
     return kept
 
 
-def infer_image(runner, names, image_path, conf_thresh, iou_thresh):
+def infer_image(runner, names, image_path, conf_thresh, iou_thresh, max_detections=DEFAULT_MAX_DETECTIONS):
     image = cv2.imread(image_path)
     if image is None:
         raise RuntimeError("Could not read image: {}".format(image_path))
@@ -273,6 +287,7 @@ def infer_image(runner, names, image_path, conf_thresh, iou_thresh):
     tensor = preprocess(image)
     outputs = runner.infer(tensor)
     detections = nms(decode_yolov4_tiny(outputs, image.shape[1], image.shape[0], conf_thresh), iou_thresh)
+    detections = sorted(detections, key=lambda item: item[1], reverse=True)[:max_detections]
 
     payload = []
     for class_id, confidence, bbox in detections:
@@ -294,7 +309,7 @@ def infer_image(runner, names, image_path, conf_thresh, iou_thresh):
     return payload
 
 
-def serve_requests(runner, names, default_conf, default_iou):
+def serve_requests(runner, names, default_conf, default_iou, default_max_detections):
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -308,7 +323,8 @@ def serve_requests(runner, names, default_conf, default_iou):
 
             conf_thresh = float(request.get("conf", default_conf))
             iou_thresh = float(request.get("iou", default_iou))
-            detections = infer_image(runner, names, image_path, conf_thresh, iou_thresh)
+            max_detections = int(request.get("max_detections", default_max_detections))
+            detections = infer_image(runner, names, image_path, conf_thresh, iou_thresh, max_detections)
             response = {"ok": True, "detections": detections}
         except Exception as exc:
             response = {"ok": False, "error": str(exc)}
@@ -331,10 +347,10 @@ def main():
 
     if args.server:
         print("tkdnn_json_infer server ready", file=sys.stderr, flush=True)
-        serve_requests(runner, names, args.conf, args.iou)
+        serve_requests(runner, names, args.conf, args.iou, args.max_detections)
         return
 
-    payload = infer_image(runner, names, args.image, args.conf, args.iou)
+    payload = infer_image(runner, names, args.image, args.conf, args.iou, args.max_detections)
     print(json.dumps(payload, separators=(",", ":")))
 
 

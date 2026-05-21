@@ -10,6 +10,7 @@ CONFIG = {
     "model_path":     "yolov8n.engine",
     "conf_threshold": 0.25,
     "iou_threshold":  0.45,
+    "max_detections": 50,
     "imgsz":          416,
     "mjpeg_fps":      20,
     "host":           "0.0.0.0",
@@ -43,7 +44,7 @@ CONFIG = {
         "command": "/home/ta/hardteam_ws/tensorrt/chi_ws/tools/tkdnn_json_infer",
         # persistent_command keeps PyCUDA/TensorRT and the .rt file loaded.
         # The first request may still include one-time TensorRT startup cost.
-        "timeout_sec": 15.0,
+        "timeout_sec": 60.0,
     },
 
     # Capture stability controls for Jetson Nano.

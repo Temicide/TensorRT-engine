@@ -158,6 +158,8 @@ class TkDNNDarknetModel:
             str(CONFIG["conf_threshold"]),
             "--iou",
             str(CONFIG["iou_threshold"]),
+            "--max-detections",
+            str(CONFIG.get("max_detections", 50)),
         ])
         if image_path is not None:
             cmd.extend(["--image", image_path])
@@ -217,6 +219,7 @@ class TkDNNDarknetModel:
                 "image": image_path,
                 "conf": CONFIG["conf_threshold"],
                 "iou": CONFIG["iou_threshold"],
+                "max_detections": CONFIG.get("max_detections", 50),
             },
             separators=(",", ":"),
         )
@@ -311,6 +314,8 @@ class TkDNNDarknetModel:
                 if line:
                     with self._stderr_lock:
                         self._stderr_tail.append(line)
+                    if line == "tkdnn_json_infer server ready":
+                        log.info("[tkdnn bridge] %s", line)
         except Exception:
             pass
 

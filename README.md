@@ -178,12 +178,13 @@ Then edit `config.py`:
 "tkdnn": {
     "bridge_mode": "persistent_command",
     "command": "/path/to/tkdnn_json_infer",
-    "timeout_sec": 15.0,
+    "timeout_sec": 60.0,
 }
 ```
 
 Keep the existing `cfg`, `weights`, and `names` paths unless you moved the
-model files.
+model files. Use the top-level `max_detections` setting to cap drawn/logged
+detections per frame.
 
 On Jetson Nano, test one manual single-shot bridge run before starting all
 cameras:

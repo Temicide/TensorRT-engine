@@ -17,15 +17,9 @@ Start from editing config.py
 """
 import os
 import logging
-from core.model_factory import load_detector_model
-from config import CONFIG
-from core.pipeline import start_pipelines
-from routers.cameras import router as cameras_router
-from routers.detections import router as detections_router
-from routers.logs import router as logs_router
 
 # Make OpenCV/FFmpeg RTSP capture more stable on Jetson Nano.
-# These options must be set before cv2 opens any VideoCapture.
+# These options must be set before any import path imports cv2.
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp|stimeout;5000000|max_delay;500000")
 
 import cv2
@@ -34,6 +28,13 @@ try:
     cv2.setNumThreads(1)
 except Exception:
     pass
+
+from core.model_factory import load_detector_model
+from config import CONFIG
+from core.pipeline import start_pipelines
+from routers.cameras import router as cameras_router
+from routers.detections import router as detections_router
+from routers.logs import router as logs_router
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse

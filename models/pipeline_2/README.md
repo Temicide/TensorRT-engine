@@ -121,9 +121,12 @@ The server is configured through `config.py`:
     "names": "models/pipeline_2/darknet/coco.names",
     "bridge_mode": "persistent_command",
     "command": "/path/to/tkdnn_json_infer",
-    "timeout_sec": 15.0,
+    "timeout_sec": 60.0,
 }
 ```
+
+Use the top-level `max_detections` setting in `config.py` to cap drawn/logged
+detections per frame.
 
 The Python server cannot call the tkDNN C++ library directly with only
 `yolov4-tiny.cfg` and `yolov4-tiny.weights`. It expects a small executable
