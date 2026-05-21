@@ -79,6 +79,8 @@ def run_tensorrt(rt_path, tensor):
     if context is None:
         raise RuntimeError("Could not create TensorRT execution context")
 
+    batch_size = int(tensor.shape[0])
+    implicit_batch = bool(getattr(engine, "has_implicit_batch_dimension", False))
     bindings = [0] * engine.num_bindings
     allocations = []
     outputs = []
@@ -86,13 +88,14 @@ def run_tensorrt(rt_path, tensor):
     for idx in range(engine.num_bindings):
         shape = tuple(int(dim) for dim in engine.get_binding_shape(idx))
         dtype = trt.nptype(engine.get_binding_dtype(idx))
-        size = int(np.prod(shape))
 
         if engine.binding_is_input(idx):
             host = np.ascontiguousarray(tensor.astype(dtype, copy=False))
         else:
+            output_shape = (batch_size,) + shape if implicit_batch else shape
+            size = int(np.prod(output_shape))
             host = cuda.pagelocked_empty(size, dtype)
-            outputs.append((idx, shape, host))
+            outputs.append((idx, output_shape, host))
 
         device = cuda.mem_alloc(host.nbytes)
         bindings[idx] = int(device)
@@ -103,7 +106,10 @@ def run_tensorrt(rt_path, tensor):
         if engine.binding_is_input(idx):
             cuda.memcpy_htod_async(device, host, stream)
 
-    ok = context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+    if implicit_batch:
+        ok = context.execute_async(batch_size=batch_size, bindings=bindings, stream_handle=stream.handle)
+    else:
+        ok = context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
     if not ok:
         raise RuntimeError("TensorRT execution failed")
 
