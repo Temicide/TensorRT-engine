@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import collections
 import logging
 import threading
@@ -195,7 +193,7 @@ def inference_worker(model):
             )
 
 
-def _run_tracker(tracker: DeepSORTTracker, reid: MobileNetv2ReID | None, frame: np.ndarray, detections: list[dict]) -> list[dict]:
+def _run_tracker(tracker, reid, frame, detections):
     bboxes = np.array([d["bbox_xyxy"] for d in detections], dtype=np.float32)
     features = None
     if reid is not None:
@@ -233,7 +231,7 @@ def _run_tracker(tracker: DeepSORTTracker, reid: MobileNetv2ReID | None, frame: 
     return enriched
 
 
-def _compute_iou(a: np.ndarray, b: np.ndarray) -> float:
+def _compute_iou(a, b):
     xx1 = max(a[0], b[0])
     yy1 = max(a[1], b[1])
     xx2 = min(a[2], b[2])

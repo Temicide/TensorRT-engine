@@ -1,12 +1,10 @@
-from __future__ import annotations
-
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from core.kalman import KalmanFilter
 
 
-def _iou(bbox_a: np.ndarray, bbox_b: np.ndarray) -> float:
+def _iou(bbox_a, bbox_b):
     xx1 = max(bbox_a[0], bbox_b[0])
     yy1 = max(bbox_a[1], bbox_b[1])
     xx2 = min(bbox_a[2], bbox_b[2])
@@ -20,7 +18,7 @@ def _iou(bbox_a: np.ndarray, bbox_b: np.ndarray) -> float:
     return intersection / max(union, 1e-6)
 
 
-def iou_cost_matrix(predicted_bboxes: np.ndarray, det_bboxes: np.ndarray) -> np.ndarray:
+def iou_cost_matrix(predicted_bboxes, det_bboxes):
     n_tracks = len(predicted_bboxes)
     n_dets = len(det_bboxes)
     if n_tracks == 0 or n_dets == 0:
@@ -32,7 +30,7 @@ def iou_cost_matrix(predicted_bboxes: np.ndarray, det_bboxes: np.ndarray) -> np.
     return cost
 
 
-def appearance_cost_matrix(track_features: list[list[np.ndarray]], det_features: list[np.ndarray | None]) -> np.ndarray:
+def appearance_cost_matrix(track_features, det_features):
     n_tracks = len(track_features)
     n_dets = len(det_features)
     cost = np.full((n_tracks, n_dets), 1.0, dtype=np.float32)
@@ -52,14 +50,14 @@ def appearance_cost_matrix(track_features: list[list[np.ndarray]], det_features:
 class Track:
     _next_id = 1
 
-    def __init__(self, bbox: np.ndarray, feature: np.ndarray | None = None):
+    def __init__(self, bbox, feature=None):
         self.track_id = Track._next_id
         Track._next_id += 1
         self.kf = KalmanFilter(bbox)
         self.hits = 1
         self.age = 1
         self.time_since_update = 0
-        self.features: list[np.ndarray] = []
+        self.features = []
         if feature is not None:
             self.features.append(feature)
         self._update_mean_bbox()
@@ -73,7 +71,7 @@ class Track:
         self.time_since_update += 1
         self._update_mean_bbox()
 
-    def update(self, bbox: np.ndarray, feature: np.ndarray | None = None):
+    def update(self, bbox, feature=None):
         self.kf.update(bbox)
         self.hits += 1
         self.time_since_update = 0
@@ -81,7 +79,7 @@ class Track:
             self.features.append(feature)
         self._update_mean_bbox()
 
-    def get_state_bbox(self) -> np.ndarray:
+    def get_state_bbox(self):
         return self._curr_bbox.copy()
 
     def mark_missed(self):
@@ -91,23 +89,23 @@ class Track:
 class DeepSORTTracker:
     def __init__(
         self,
-        max_age: int = 30,
-        min_hits: int = 3,
-        iou_threshold: float = 0.3,
-        gating_threshold: float = 9.4877,
-        gating_only_position: bool = False,
-        appearance_weight: float = 0.5,
-        max_features: int = 100,
+        max_age=30,
+        min_hits=3,
+        iou_threshold=0.3,
+        gating_threshold=9.4877,
+        gating_only_position=False,
+        appearance_weight=0.5,
+        max_features=100,
     ):
         self.max_age = max_age
         self.min_hits = min_hits
         self.iou_threshold = iou_threshold
         self.appearance_weight = appearance_weight
         self.max_features = max_features
-        self.tracks: list[Track] = []
+        self.tracks = []
         self.frame_count = 0
 
-    def _match_iou(self, bboxes: np.ndarray, iou_threshold: float):
+    def _match_iou(self, bboxes, iou_threshold):
         if len(self.tracks) == 0:
             return np.empty((0, 2), dtype=int), np.arange(len(bboxes)), np.array([], dtype=int)
         if len(bboxes) == 0:
@@ -136,7 +134,7 @@ class DeepSORTTracker:
         matched_arr = np.array(matched, dtype=int).reshape(-1, 2) if matched else np.empty((0, 2), dtype=int)
         return matched_arr, np.array(sorted(unmatched_dets), dtype=int), np.array(sorted(unmatched_tracks), dtype=int)
 
-    def _match_deep(self, bboxes: np.ndarray, features: list[np.ndarray | None]):
+    def _match_deep(self, bboxes, features):
         if len(self.tracks) == 0:
             return np.empty((0, 2), dtype=int), np.arange(len(bboxes)), np.array([], dtype=int)
         if len(bboxes) == 0:
@@ -175,7 +173,7 @@ class DeepSORTTracker:
         matched_arr = np.array(matched, dtype=int).reshape(-1, 2) if matched else np.empty((0, 2), dtype=int)
         return matched_arr, np.array(sorted(unmatched_dets), dtype=int), np.array(sorted(unmatched_tracks), dtype=int)
 
-    def update(self, bboxes: np.ndarray, features: list[np.ndarray | None] | None = None):
+    def update(self, bboxes, features=None):
         self.frame_count += 1
 
         for track in self.tracks:
@@ -192,7 +190,6 @@ class DeepSORTTracker:
 
         unmatched_tracks_set = set(unmatched_tracks.tolist()) if len(unmatched_tracks) > 0 else set()
         high_iou_tracks = []
-        high_iou_dets = []
         for t_idx in unmatched_tracks_set:
             if self.tracks[t_idx].time_since_update == 1:
                 high_iou_tracks.append(t_idx)
@@ -221,7 +218,7 @@ class DeepSORTTracker:
 
         return self._collect_tracks()
 
-    def _match_iou_second(self, bboxes: np.ndarray, det_indices: np.ndarray, track_indices: np.ndarray):
+    def _match_iou_second(self, bboxes, det_indices, track_indices):
         track_bboxes = np.array([self.tracks[t].get_state_bbox() for t in track_indices])
         det_bboxes = bboxes[det_indices]
         iou_cost = iou_cost_matrix(track_bboxes, det_bboxes)
@@ -249,7 +246,7 @@ class DeepSORTTracker:
         remaining_tracks = np.array([t for t in track_indices if t not in matched_tracks], dtype=int)
         return matched_arr, remaining_dets, remaining_tracks
 
-    def _collect_tracks(self) -> list[dict]:
+    def _collect_tracks(self):
         results = []
         for track in self.tracks:
             if track.hits >= self.min_hits or self.frame_count <= self.min_hits:
