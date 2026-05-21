@@ -41,7 +41,7 @@ CONFIG = {
         # Use a larger jitter buffer for H.264 RTSP on Nano. Too little latency,
         # especially with drop-on-latency enabled, can drop reference frames and
         # produce decoder warnings such as "reference in DPB was never decoded".
-        "rtsp_latency_ms": 1000,
+        "rtsp_latency_ms": 200,
         "rtsp_tcp": True,
         "drop_on_latency": False,
         "reconnect_sec": 5,
@@ -73,9 +73,9 @@ CONFIG = {
 
         # Streammux output size. Keep this near the camera aspect ratio; nvinfer
         # handles model input resizing with aspect-ratio padding.
-        "mux_width": 1280,
-        "mux_height": 720,
-        "batched_push_timeout_us": 40000,
+        "mux_width": 960,
+        "mux_height": 544,
+        "batched_push_timeout_us": 10,
 
         # Optional tracker. Keep disabled until detection metadata is validated.
         "enable_tracker": False,
