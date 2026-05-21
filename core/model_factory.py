@@ -12,7 +12,7 @@ def load_detector_model():
     if backend == "tkdnn_darknet":
         tkdnn_config = CONFIG.get("tkdnn", {})
         num_cameras = len(CONFIG.get("active_cameras") or CONFIG.get("cameras", {}))
-        num_instances = tkdnn_config.get("num_bridge_instances", num_cameras)
+        num_instances = tkdnn_config.get("num_bridge_instances") or num_cameras
         if num_instances < 1:
             num_instances = 1
         return TkDNNDarknetModelPool(tkdnn_config, num_instances)
