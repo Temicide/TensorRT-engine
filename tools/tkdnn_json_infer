@@ -1,0 +1,236 @@
+#!/usr/bin/env python3
+import argparse
+import ctypes
+import json
+import math
+import os
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+DEFAULT_RT = "/home/ta/tkDNN/build/yolo4tiny_fp16.rt"
+DEFAULT_TKDNN_BUILD = "/home/ta/tkDNN/build"
+INPUT_SIZE = 416
+NUM_CLASSES = 80
+ANCHORS = [(10, 14), (23, 27), (37, 58), (81, 82), (135, 169), (344, 319)]
+MASKS_BY_GRID = {
+    13: [3, 4, 5],
+    26: [1, 2, 3],
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run tkDNN YOLOv4-tiny .rt inference and emit JSON detections.")
+    parser.add_argument("--rt", default=os.environ.get("TKDNN_RT", DEFAULT_RT), help="Path to tkDNN .rt file.")
+    parser.add_argument("--cfg", default="", help="Accepted for compatibility with the FastAPI adapter.")
+    parser.add_argument("--weights", default="", help="Accepted for compatibility with the FastAPI adapter.")
+    parser.add_argument("--names", required=True, help="Path to class names file.")
+    parser.add_argument("--image", required=True, help="Path to input image.")
+    parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold.")
+    parser.add_argument("--iou", type=float, default=0.45, help="NMS IoU threshold.")
+    parser.add_argument("--tkdnn-build", default=os.environ.get("TKDNN_BUILD", DEFAULT_TKDNN_BUILD))
+    return parser.parse_args()
+
+
+def load_tkdnn_plugins(tkdnn_build):
+    build_dir = Path(tkdnn_build)
+    for lib_name in ("libkernels.so", "libtkDNN.so"):
+        lib_path = build_dir / lib_name
+        if lib_path.is_file():
+            ctypes.CDLL(str(lib_path), mode=ctypes.RTLD_GLOBAL)
+
+
+def sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def load_names(path):
+    with open(path, "r", encoding="utf-8") as names_file:
+        return [line.strip() for line in names_file if line.strip()]
+
+
+def preprocess(image):
+    resized = cv2.resize(image, (INPUT_SIZE, INPUT_SIZE), interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    nchw = rgb.astype(np.float32) / 255.0
+    nchw = np.transpose(nchw, (2, 0, 1))[None, ...]
+    return np.ascontiguousarray(nchw)
+
+
+def run_tensorrt(rt_path, tensor):
+    import pycuda.autoinit  # noqa: F401
+    import pycuda.driver as cuda
+    import tensorrt as trt
+
+    logger = trt.Logger(trt.Logger.ERROR)
+    trt.init_libnvinfer_plugins(logger, "")
+    with open(rt_path, "rb") as engine_file:
+        engine_bytes = engine_file.read()
+
+    runtime = trt.Runtime(logger)
+    engine = runtime.deserialize_cuda_engine(engine_bytes)
+    if engine is None:
+        raise RuntimeError("Could not deserialize tkDNN .rt file: {}".format(rt_path))
+
+    context = engine.create_execution_context()
+    if context is None:
+        raise RuntimeError("Could not create TensorRT execution context")
+
+    bindings = [0] * engine.num_bindings
+    allocations = []
+    outputs = []
+
+    for idx in range(engine.num_bindings):
+        shape = tuple(int(dim) for dim in engine.get_binding_shape(idx))
+        dtype = trt.nptype(engine.get_binding_dtype(idx))
+        size = int(np.prod(shape))
+
+        if engine.binding_is_input(idx):
+            host = np.ascontiguousarray(tensor.astype(dtype, copy=False))
+        else:
+            host = cuda.pagelocked_empty(size, dtype)
+            outputs.append((idx, shape, host))
+
+        device = cuda.mem_alloc(host.nbytes)
+        bindings[idx] = int(device)
+        allocations.append((idx, host, device))
+
+    stream = cuda.Stream()
+    for idx, host, device in allocations:
+        if engine.binding_is_input(idx):
+            cuda.memcpy_htod_async(device, host, stream)
+
+    ok = context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+    if not ok:
+        raise RuntimeError("TensorRT execution failed")
+
+    for idx, host, device in allocations:
+        if not engine.binding_is_input(idx):
+            cuda.memcpy_dtoh_async(host, device, stream)
+    stream.synchronize()
+
+    tensors = []
+    for _, shape, host in outputs:
+        tensors.append(np.array(host).reshape(shape))
+    return tensors
+
+
+def decode_yolov4_tiny(outputs, orig_w, orig_h, conf_thresh):
+    decoded = []
+
+    for output in outputs:
+        arr = np.asarray(output)
+        arr = np.squeeze(arr)
+        if arr.ndim != 3:
+            continue
+
+        channels, grid_h, grid_w = arr.shape
+        if grid_h != grid_w or channels % 3 != 0:
+            continue
+
+        masks = MASKS_BY_GRID.get(grid_h)
+        if masks is None:
+            continue
+
+        attrs = channels // 3
+        classes = attrs - 5
+        pred = arr.reshape(3, attrs, grid_h, grid_w)
+
+        for anchor_slot, anchor_idx in enumerate(masks):
+            anchor_w, anchor_h = ANCHORS[anchor_idx]
+            values = pred[anchor_slot]
+
+            tx = values[0]
+            ty = values[1]
+            tw = values[2]
+            th = values[3]
+            objectness = sigmoid(values[4])
+            class_scores = sigmoid(values[5 : 5 + classes])
+
+            best_class = np.argmax(class_scores, axis=0)
+            best_score = np.max(class_scores, axis=0)
+            confidence = objectness * best_score
+            ys, xs = np.where(confidence >= conf_thresh)
+
+            for y, x in zip(ys, xs):
+                conf = float(confidence[y, x])
+                cls = int(best_class[y, x])
+                bx = (float(sigmoid(tx[y, x])) + x) / grid_w * INPUT_SIZE
+                by = (float(sigmoid(ty[y, x])) + y) / grid_h * INPUT_SIZE
+                bw = math.exp(float(np.clip(tw[y, x], -10.0, 10.0))) * anchor_w
+                bh = math.exp(float(np.clip(th[y, x], -10.0, 10.0))) * anchor_h
+
+                x1 = (bx - bw / 2.0) * orig_w / INPUT_SIZE
+                y1 = (by - bh / 2.0) * orig_h / INPUT_SIZE
+                x2 = (bx + bw / 2.0) * orig_w / INPUT_SIZE
+                y2 = (by + bh / 2.0) * orig_h / INPUT_SIZE
+                decoded.append((cls, conf, [x1, y1, x2, y2]))
+
+    return decoded
+
+
+def nms(detections, iou_thresh):
+    if not detections:
+        return []
+
+    boxes = []
+    scores = []
+    for _, conf, bbox in detections:
+        x1, y1, x2, y2 = bbox
+        boxes.append([float(x1), float(y1), float(max(0.0, x2 - x1)), float(max(0.0, y2 - y1))])
+        scores.append(float(conf))
+
+    indices = cv2.dnn.NMSBoxes(boxes, scores, 0.0, iou_thresh)
+    if len(indices) == 0:
+        return []
+    flat = np.array(indices).reshape(-1).tolist()
+    return [detections[i] for i in flat]
+
+
+def main():
+    args = parse_args()
+    rt_path = Path(args.rt)
+    if not rt_path.is_file():
+        raise RuntimeError("tkDNN .rt file does not exist: {}".format(rt_path))
+
+    image = cv2.imread(args.image)
+    if image is None:
+        raise RuntimeError("Could not read image: {}".format(args.image))
+
+    names = load_names(args.names)
+    load_tkdnn_plugins(args.tkdnn_build)
+
+    tensor = preprocess(image)
+    outputs = run_tensorrt(str(rt_path), tensor)
+    detections = nms(decode_yolov4_tiny(outputs, image.shape[1], image.shape[0], args.conf), args.iou)
+
+    payload = []
+    for class_id, confidence, bbox in detections:
+        class_name = names[class_id] if 0 <= class_id < len(names) else str(class_id)
+        x1, y1, x2, y2 = bbox
+        payload.append(
+            {
+                "class_id": class_id,
+                "class_name": class_name,
+                "confidence": round(float(confidence), 4),
+                "bbox_xyxy": [
+                    round(max(0.0, min(float(x1), image.shape[1] - 1)), 1),
+                    round(max(0.0, min(float(y1), image.shape[0] - 1)), 1),
+                    round(max(0.0, min(float(x2), image.shape[1] - 1)), 1),
+                    round(max(0.0, min(float(y2), image.shape[0] - 1)), 1),
+                ],
+            }
+        )
+
+    print(json.dumps(payload, separators=(",", ":")))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)

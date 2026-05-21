@@ -30,19 +30,22 @@ class TkDNNDarknetModel:
         self.cfg = Path(self.config.get("cfg", self.darknet_dir / "yolov4-tiny.cfg"))
         self.weights = Path(self.config.get("weights", self.darknet_dir / "yolov4-tiny.weights"))
         self.names = Path(self.config.get("names", self.darknet_dir / "coco.names"))
+        self.rt = Path(self.config["rt"]) if self.config.get("rt") else None
         self.bridge_mode = self.config.get("bridge_mode", "image_command")
         self.command = self.config.get("command", "")
         self.timeout_sec = float(self.config.get("timeout_sec", 2.0))
         self.imgsz = int(CONFIG.get("imgsz", 416))
 
         self._validate_darknet_assets()
+        self._validate_rt_asset()
         self._validate_bridge()
 
         log.info(
-            "Loaded tkDNN/Darknet adapter: cfg=%s weights=%s names=%s command=%s",
+            "Loaded tkDNN/Darknet adapter: cfg=%s weights=%s names=%s rt=%s command=%s",
             self.cfg,
             self.weights,
             self.names,
+            self.rt,
             self.command,
         )
 
@@ -61,6 +64,16 @@ class TkDNNDarknetModel:
                 "  ./download_yolov4_tiny_darknet.sh".format("\n  ".join(missing))
             )
 
+    def _validate_rt_asset(self):
+        if self.rt is not None and not self.rt.is_file():
+            raise RuntimeError(
+                "tkDNN TensorRT runtime file is missing: {}\n\n"
+                "Build it on the Jetson with:\n"
+                "  cd /home/ta/tkDNN/build\n"
+                "  export TKDNN_MODE=FP16\n"
+                "  ./test_yolo4tiny".format(self.rt)
+            )
+
     def _validate_bridge(self):
         if self.bridge_mode != "image_command":
             raise RuntimeError(
@@ -77,7 +90,7 @@ class TkDNNDarknetModel:
                 "small tkDNN executable bridge, then set:\n"
                 "  CONFIG['tkdnn']['command'] = '/path/to/tkdnn_json_infer'\n\n"
                 "Expected bridge command:\n"
-                "  <command> --cfg <cfg> --weights <weights> --names <names> "
+                "  <command> --rt <rt> --cfg <cfg> --weights <weights> --names <names> "
                 "--image <jpg> --conf <float> --iou <float>\n\n"
                 "Expected stdout JSON:\n"
                 "  [{\"class_id\":2,\"class_name\":\"car\",\"confidence\":0.91,"
@@ -105,6 +118,10 @@ class TkDNNDarknetModel:
 
             cmd = [
                 self.command,
+            ]
+            if self.rt is not None:
+                cmd.extend(["--rt", str(self.rt)])
+            cmd.extend([
                 "--cfg",
                 str(self.cfg),
                 "--weights",
@@ -117,7 +134,7 @@ class TkDNNDarknetModel:
                 str(CONFIG["conf_threshold"]),
                 "--iou",
                 str(CONFIG["iou_threshold"]),
-            ]
+            ])
             completed = subprocess.run(
                 cmd,
                 check=False,
@@ -166,4 +183,3 @@ class TkDNNDarknetModel:
             "confidence": round(float(detection["confidence"]), 4),
             "bbox_xyxy": [round(float(value), 1) for value in bbox],
         }
-

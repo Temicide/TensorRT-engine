@@ -83,13 +83,21 @@ If FP16 fails on your JetPack/TensorRT version, edit the script and remove
 For tkDNN, do not use the ONNX file. Use tkDNN's Darknet exporter flow:
 
 ```bash
+sudo apt update
+sudo apt install -y build-essential cmake git libopencv-dev libyaml-cpp-dev libeigen3-dev
+
 git clone https://github.com/ceccocats/tkDNN.git
 cd tkDNN
-mkdir build
+mkdir -p build
 cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
-make
+make -j2
 ```
+
+If CMake previously failed with `Could not find a package configuration file
+provided by "yaml-cpp"`, install `libyaml-cpp-dev`, remove the stale CMake
+cache with `rm -rf CMakeCache.txt CMakeFiles`, then run the `cmake` command
+again.
 
 Then export YOLOv4-tiny Darknet weights using the tkDNN documentation:
 
