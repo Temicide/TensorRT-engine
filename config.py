@@ -23,7 +23,7 @@ CONFIG = {
     "gpu_required":   True,
 
     # Cameras to start. Keep deepstream.batch_size equal to this count.
-    "active_cameras": ["cam1","cam2","cam3","cam4","cam5"],
+    "active_cameras": ["cam2"],
 
     "cameras": {
         "cam1": "rtsp://10.0.11.153:8554/cctv06",
