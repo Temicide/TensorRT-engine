@@ -11,6 +11,13 @@ def _safe_put(queue: asyncio.Queue, data: str) -> None:
         pass
 
 
+def _current_loop():
+    # Jetson Nano / JetPack 4 commonly runs Python 3.6, which does not have
+    # asyncio.get_running_loop(). Inside these async generators, get_event_loop()
+    # returns the active uvicorn loop.
+    return asyncio.get_event_loop()
+
+
 # SSE is the live event broadcasting to the clients
 # ─────────────────────────── SSE broadcast ────────────────────────────────────
 def broadcast_sse(cam_id, record):
@@ -28,7 +35,7 @@ def broadcast_sse(cam_id, record):
 # ── SSE per camera ─────────────────────────────────────────────────────────────
 async def cam_sse_gen(cam_id):
     q: asyncio.Queue = asyncio.Queue(maxsize=100)
-    subscriber = (asyncio.get_running_loop(), q)
+    subscriber = (_current_loop(), q)
     with sse_sub_lock:
         per_cam_sse_subscribers[cam_id].append(subscriber)
     try:
@@ -47,7 +54,7 @@ async def cam_sse_gen(cam_id):
 # ── SSE global (all cameras) ───────────────────────────────────────────────────
 async def global_sse_gen():
     q: asyncio.Queue = asyncio.Queue(maxsize=200)
-    subscriber = (asyncio.get_running_loop(), q)
+    subscriber = (_current_loop(), q)
     with sse_sub_lock:
         global_sse_subscribers.append(subscriber)
     try:
