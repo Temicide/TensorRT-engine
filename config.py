@@ -85,8 +85,8 @@ CONFIG = {
         # metadata/API mode. appsink preserves the MJPEG endpoint but copies
         # frames to CPU and costs Nano CPU time.
         "display": False,
-        "sink_type": "fakesink",
-        "enable_mjpeg_output": False,
+        "sink_type": "appsink",
+        "enable_mjpeg_output": True,
         "jpeg_quality": 70,
     },
 }
