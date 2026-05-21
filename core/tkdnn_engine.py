@@ -138,7 +138,8 @@ class TkDNNDarknetModel:
             completed = subprocess.run(
                 cmd,
                 check=False,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 timeout=self.timeout_sec,
             )
