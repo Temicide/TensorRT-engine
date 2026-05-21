@@ -220,7 +220,7 @@ class DeepStreamPipeline:
 
         source.connect("pad-added", self._on_rtsp_pad_added, depay)
 
-        sinkpad = streammux.get_request_pad("sink_%u")
+        sinkpad = self._request_streammux_sink_pad(streammux, index)
         if sinkpad is None:
             raise DeepStreamConfigError(f"Could not request streammux sink pad for {cam_id}")
         source_id = self._streammux_source_id(sinkpad, index)
@@ -232,6 +232,15 @@ class DeepStreamPipeline:
 
         self.source_id_to_cam_id[source_id] = cam_id
         log.info("[%s] DeepStream RTSP source configured: %s (source_id=%d)", cam_id, uri, source_id)
+
+    def _request_streammux_sink_pad(self, streammux, index: int):
+        # Service Maker accepts the pad template. Older DS6 GStreamer bindings
+        # often require the concrete request pad name.
+        for pad_name in ("sink_%u", f"sink_{index}"):
+            pad = streammux.get_request_pad(pad_name)
+            if pad is not None:
+                return pad
+        return None
 
     def _streammux_source_id(self, sinkpad, fallback_index: int) -> int:
         pad_name = sinkpad.get_name() or ""
