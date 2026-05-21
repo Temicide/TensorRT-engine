@@ -406,6 +406,9 @@ class TkDNNDarknetModelPool:
     Each bridge instance internally keeps its own persistent subprocess
     (started lazily on first inference).  Warm-up is staggered so that
     the Jetson Nano does not try to create N CUDA contexts at once.
+
+    If warm-up fails for an instance (e.g. GPU memory exhausted), that
+    instance is removed from the pool so it never blocks real inference.
     """
 
     backend_name = "tkdnn_darknet_pool"
@@ -428,12 +431,17 @@ class TkDNNDarknetModelPool:
             self.num_instances,
         )
 
-    def warmup(self, stagger_sec=3.0):
+    def warmup(self, stagger_sec=5.0, warmup_timeout_sec=120.0):
         """Start all persistent bridges one-by-one with a delay.
 
         Sends a dummy (black) frame through each bridge to trigger TensorRT
         engine loading.  Staggering avoids N simultaneous CUDA context
         creations on Jetson Nano which can exhaust GPU memory.
+
+        Instances that fail warmup are closed and removed from the pool so
+        they never block real inference.  A separate warmup_timeout_sec
+        (default 120 s) gives engine startup more time than the normal
+        inference timeout.
         """
         import numpy as np
         dummy = np.zeros(
@@ -441,19 +449,55 @@ class TkDNNDarknetModelPool:
             dtype=np.uint8,
         )
 
+        original_timeouts = []
+        for inst in self.instances:
+            original_timeouts.append(inst.timeout_sec)
+
+        alive = []
         for i, inst in enumerate(self.instances):
             log.info("Warming up bridge instance %d/%d ...", i + 1, self.num_instances)
+            inst.timeout_sec = warmup_timeout_sec
             try:
                 inst.infer_frame(dummy)
+                alive.append(inst)
             except Exception as exc:
                 log.warning(
-                    "Bridge instance %d warmup failed (will retry on first real frame): %s",
-                    i + 1, exc,
+                    "Bridge instance %d/%d warmup failed, removing from pool: %s",
+                    i + 1, self.num_instances, exc,
                 )
+                try:
+                    inst.close()
+                except Exception:
+                    pass
             if i < self.num_instances - 1:
                 time.sleep(stagger_sec)
 
-        log.info("All %d bridge instances warmed up.", self.num_instances)
+        removed = self.num_instances - len(alive)
+        self.instances = alive
+        self.num_instances = len(alive)
+
+        if self.num_instances == 0:
+            raise RuntimeError(
+                "All {} tkDNN bridge instances failed warmup. GPU memory may be "
+                "exhausted. Reduce num_bridge_instances in config or free GPU memory.".format(
+                    self.num_instances + removed
+                )
+            )
+
+        if removed > 0:
+            log.warning(
+                "Removed %d bridge instance(s) that failed warmup. Pool size: %d",
+                removed, self.num_instances,
+            )
+
+        for inst in self.instances:
+            inst.timeout_sec = float(self.config.get("timeout_sec", 60.0))
+
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.num_instances, thread_name_prefix="tkdnn-infer",
+        )
+
+        log.info("Bridge pool ready: %d healthy instance(s).", self.num_instances)
 
     def infer_frames_parallel(self, cam_ids, frames):
         """Infer N frames in parallel across the bridge pool.
