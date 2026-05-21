@@ -55,10 +55,10 @@ CONFIG = {
     "active_cameras": None,
 
     "cameras": {
-        "cam1": "rtsp://172:16:30.8:8554/cctv0",
-        "cam2": "rtsp://172:16:30.8:8554/cctv1",
-        "cam3": "rtsp://172:16:30.8:8554/cctv2",
-        "cam4": "rtsp://172:16:30.8:8554/cctv3",
-        "cam5": "rtsp://172:16:30.8:8554/cctv4",
+        "cam1": "rtsp://10.0.11.153:8554/mock1",
+        "cam2": "rtsp://10.0.11.153:8554/mock5",
+        "cam3": "rtsp://10.0.11.153:8554/mock9",
+        "cam4": "rtsp://10.0.11.153:8554/cctv08",
+        "cam5": "rtsp://10.0.11.153:8554/cctv09",
     },
 }
