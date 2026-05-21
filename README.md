@@ -85,15 +85,18 @@ Create a venv that can still see NVIDIA system packages such as TensorRT:
 python3 -m venv --system-site-packages venv
 source venv/bin/activate
 python3 -m pip install --upgrade pip
-python3 -m pip install fastapi uvicorn numpy opencv-python requests
+python3 -m pip install fastapi uvicorn numpy requests
 ```
 
-If `opencv-python` causes issues on Jetson, remove it and use the JetPack
-system OpenCV package instead:
+Do not install `opencv-python` from pip on Jetson for this app. The PyPI wheel
+usually does not include GStreamer support and can shadow JetPack's working
+system OpenCV package.
+
+Fast OpenCV/GStreamer reinstall path:
 
 ```bash
-python3 -m pip uninstall -y opencv-python
-python3 -c "import cv2; print(cv2.__version__)"
+chmod +x tools/reinstall_jetson_opencv_gstreamer.sh
+tools/reinstall_jetson_opencv_gstreamer.sh
 ```
 
 ## 4. Build tkDNN
