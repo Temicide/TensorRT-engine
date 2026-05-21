@@ -45,7 +45,7 @@ CONFIG = {
         "rtsp_tcp": True,
         "drop_on_latency": False,
         "reconnect_sec": 5,
-        "decoder_num_extra_surfaces": 4,
+        "decoder_num_extra_surfaces": 10,
 
         # Must be a raw YOLO detector export. Do not use an ONNX with NMS,
         # TopK, or Mod post-processing baked into the graph.
@@ -65,7 +65,7 @@ CONFIG = {
         "input_width": 640,
         "input_height": 640,
         "output_blob_names": "output0",
-        "confidence_threshold": 0.25,
+        "confidence_threshold": 0.01,
         "iou_threshold": 0.45,
         "topk": 300,
         "interval": 0,
