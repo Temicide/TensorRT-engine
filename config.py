@@ -45,15 +45,14 @@ CONFIG = {
 
         # Must be a raw YOLO detector export. Do not use an ONNX with NMS,
         # TopK, or Mod post-processing baked into the graph.
+        # Use the prebuilt FP16 engine (must have been generated on this exact Nano).
         "onnx_model_path": "models/pipeline_beta/yolov8n(1).onnx",
-        "engine_path": "model_b5_gpu0_fp32.engine",
+        "engine_path": "models/pipeline_beta/yolov8n_fp16.engine",
         "labels_path": "configs/deepstream/labels_coco.txt",
         "custom_parser_path": "/opt/nvidia/deepstream/deepstream-6.0/sources/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so",
         "primary_gie_config_path": "configs/deepstream/primary_gie_yolov8n_nano.txt",
 
-        # nvinfer settings. Start with FP32 on Nano; try network-mode=2 only
-        # after FP32 works end to end.
-        "network_mode": 0,  # 0=FP32, 1=INT8, 2=FP16
+        "network_mode": 2,  # 0=FP32, 1=INT8, 2=FP16
         "batch_size": 5,
         "gpu_id": 0,
         "num_detected_classes": 80,
