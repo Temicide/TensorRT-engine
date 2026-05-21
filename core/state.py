@@ -35,7 +35,8 @@ detection_log = []
 detection_log_lock = threading.Lock()
 MAX_LOG = 5000
 
-# SSE queues: per-camera subscribers + global subscribers
+# SSE subscribers store (event_loop, asyncio.Queue) pairs so the DeepStream GLib
+# thread can publish with loop.call_soon_threadsafe().
 global_sse_subscribers = []
 per_cam_sse_subscribers = {cid: [] for cid in cam_ids}
 sse_sub_lock = threading.Lock()

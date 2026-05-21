@@ -26,9 +26,11 @@ Use conservative Jetson Nano assumptions:
 - JetPack 4.6.x.
 - DeepStream 6.0 or 6.0.1.
 - CUDA 10.2 on standard JetPack 4.6.x.
-- Batch size must match the active camera count. Use one stream for debugging;
-  the checked-in config starts five configured RTSP streams.
-- Start with FP32 (`network-mode=0`). Try FP16 (`network-mode=2`) only after FP32 works.
+- Batch size must match the active camera count. The checked-in config starts
+  one active RTSP stream for debugging.
+- The checked-in runtime config uses FP16 (`network-mode=2`) with a generated
+  runtime engine path. If FP16 fails on your Nano stack, switch to FP32
+  (`network-mode=0`) and remove the stale runtime engine.
 
 ## Current Vanilla Pipeline That Was Replaced
 
@@ -46,7 +48,7 @@ Configured in `config.py` under `CONFIG["deepstream"]`:
 
 ```text
 ONNX model:        models/pipeline_beta/yolov8n(1).onnx
-Engine output:     model_b5_gpu0_fp32.engine
+Engine output:     .runtime/deepstream/yolov8n_b1_gpu0_fp16.engine
 Labels:            configs/deepstream/labels_coco.txt
 YOLO parser .so:   /opt/nvidia/deepstream/deepstream-6.0/sources/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 Primary GIE ref:   configs/deepstream/primary_gie_yolov8n_nano.txt
@@ -130,18 +132,19 @@ YOLO .pt -> ONNX -> copy ONNX to Jetson Nano -> nvinfer builds .engine
 The configured DeepStream detector path is:
 
 ```text
-models/pipeline_1/exports/yolo26n_opset12.onnx
+models/pipeline_beta/yolov8n(1).onnx
 ```
 
-To re-export:
+To re-export from a YOLOv8n `.pt` file, write to a stable path and update
+`CONFIG["deepstream"]["onnx_model_path"]` if you change the filename:
 
 ```bash
 cd models/pipeline_1
 python3 export_yolo_onnx.py \
-  --weights yolo26n.pt \
+  --weights yolov8n.pt \
   --imgsz 640 \
   --opset 12 \
-  --output exports/yolo26n_opset12.onnx
+  --output ../../models/pipeline_beta/yolov8n_deepstream_opset12.onnx
 ```
 
 Do not pass `--nms` for the DeepStream server. The DeepStream-YOLO parser
@@ -186,10 +189,10 @@ engine-create-func-name=NvDsInferYoloCudaEngineGet
 
 ## Build Or Regenerate Engine On Nano
 
-Preferred: let `nvinfer` build the engine on first run.
+Preferred: let `nvinfer` build the engine on first run under `.runtime/`.
 
 ```bash
-rm -f models/pipeline_1/exports/yolo26n_deepstream_nano_b1_fp32.engine
+rm -f .runtime/deepstream/yolov8n_b1_gpu0_fp16.engine
 python3 server.py
 ```
 
@@ -197,8 +200,8 @@ Alternative: build with `trtexec` on the same Nano:
 
 ```bash
 /usr/src/tensorrt/bin/trtexec \
-  --onnx=models/pipeline_1/exports/yolo26n_opset12.onnx \
-  --saveEngine=models/pipeline_1/exports/yolo26n_deepstream_nano_b1_fp32.engine \
+  --onnx='models/pipeline_beta/yolov8n(1).onnx' \
+  --saveEngine=.runtime/deepstream/yolov8n_b1_gpu0_fp32.engine \
   --workspace=1024 \
   --minShapes=images:1x3x640x640 \
   --optShapes=images:1x3x640x640 \
@@ -209,8 +212,8 @@ Only after FP32 works, test FP16:
 
 ```bash
 /usr/src/tensorrt/bin/trtexec \
-  --onnx=models/pipeline_1/exports/yolo26n_opset12.onnx \
-  --saveEngine=models/pipeline_1/exports/yolo26n_deepstream_nano_b1_fp16.engine \
+  --onnx='models/pipeline_beta/yolov8n(1).onnx' \
+  --saveEngine=.runtime/deepstream/yolov8n_b1_gpu0_fp16.engine \
   --fp16 \
   --workspace=1024 \
   --minShapes=images:1x3x640x640 \
@@ -218,7 +221,7 @@ Only after FP32 works, test FP16:
   --maxShapes=images:1x3x640x640
 ```
 
-If you switch to FP16, update `engine_path` and `network_mode=2` in `config.py`.
+If you switch precision, update `engine_path` and `network_mode` together in `config.py`.
 Jetson Nano does not have Orin-style Tensor Cores, so measure rather than
 assuming a large speedup.
 
@@ -245,8 +248,16 @@ Run:
 python3 -m venv --system-site-packages .venv
 . .venv/bin/activate
 pip3 install fastapi uvicorn requests numpy
+# Optional, only for sink_type="appsink" / MJPEG output:
+pip3 install opencv-python
+python3 tools/validate-deepstream-env.py
 python3 server.py
 ```
+
+The DeepStream pipeline starts from the FastAPI lifespan hook, so
+`uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1` also works. Keep
+workers at `1`; each worker process would otherwise create its own DeepStream
+pipeline.
 
 Open:
 
@@ -256,9 +267,11 @@ http://<jetson-ip>:8000/log/live
 http://<jetson-ip>:8000/detections
 ```
 
-For maximum Nano headroom, use `sink_type="fakesink"` and keep
-`enable_mjpeg_output=False`. Use `appsink` only when the existing MJPEG endpoint
-is required; it copies annotated frames to CPU and JPEG-encodes them.
+For maximum Nano headroom, keep the defaults: `sink_type="fakesink"` and
+`enable_mjpeg_output=False`. In this mode the pipeline probes metadata directly
+after `nvinfer` or `nvtracker` and skips OSD/color conversion. Use `appsink`
+only when the existing MJPEG endpoint is required; it copies annotated frames to
+CPU and JPEG-encodes them.
 
 ## Validation Checklist
 
@@ -283,7 +296,8 @@ is required; it copies annotated frames to CPU and JPEG-encodes them.
   At runtime, `core.deepstream_config` writes a generated nvinfer config to
   `/tmp/tensorrt_engine_primary_gie_yolov8n_nano.txt` using values from
   `config.py`.
-- `models/pipeline_beta/yolov8n_fp16.engine` should not be assumed valid for
-  Nano unless it was built on this exact Nano environment.
+- Checked-in `.engine` files should not be assumed valid for Nano unless they
+  were built on this exact Nano environment. Runtime engines are written under
+  `.runtime/`, which is ignored by git.
 - The separate `models/pipeline_1/vehicle_metadata_pipeline.py` script remains a
   legacy/demo workflow. The server path now consumes DeepStream metadata.

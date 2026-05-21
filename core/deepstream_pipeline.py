@@ -144,13 +144,11 @@ class DeepStreamPipeline:
 
         streammux = self._make("nvstreammux", "stream-muxer")
         pgie = self._make("nvinfer", "primary-gie")
-        nvvidconv = self._make("nvvideoconvert", "pre-osd-convert")
-        osd = self._make("nvdsosd", "onscreen-display")
-
         streammux.set_property("batch-size", int(self.ds["batch_size"]))
         streammux.set_property("width", int(self.ds.get("mux_width", 1280)))
         streammux.set_property("height", int(self.ds.get("mux_height", 720)))
         streammux.set_property("batched-push-timeout", int(self.ds.get("batched_push_timeout_us", 40000)))
+        streammux.set_property("enable-padding", 1)
         streammux.set_property("live-source", 1)
         streammux.set_property("attach-sys-ts", 1)
 
@@ -158,8 +156,6 @@ class DeepStreamPipeline:
 
         self.pipeline.add(streammux)
         self.pipeline.add(pgie)
-        self.pipeline.add(nvvidconv)
-        self.pipeline.add(osd)
 
         for index, cam_id in enumerate(self.cam_ids):
             self._add_rtsp_source(index, cam_id, streammux)
@@ -172,8 +168,8 @@ class DeepStreamPipeline:
             self.pipeline.add(tracker)
             elements.append(tracker)
 
-        elements.extend([nvvidconv, osd])
-        sink_elements = self._add_sink_branch(osd)
+        metadata_element = elements[-1]
+        sink_elements = self._add_sink_branch()
         elements.extend(sink_elements)
 
         for current, next_element in zip(elements, elements[1:]):
@@ -182,10 +178,12 @@ class DeepStreamPipeline:
                     f"Failed to link {current.get_name()} -> {next_element.get_name()}"
                 )
 
-        osd_sink_pad = osd.get_static_pad("sink")
-        if osd_sink_pad is None:
-            raise DeepStreamConfigError("Could not get nvdsosd sink pad for metadata probe.")
-        osd_sink_pad.add_probe(self.Gst.PadProbeType.BUFFER, self._metadata_probe, None)
+        metadata_src_pad = metadata_element.get_static_pad("src")
+        if metadata_src_pad is None:
+            raise DeepStreamConfigError(
+                f"Could not get {metadata_element.get_name()} src pad for metadata probe."
+            )
+        metadata_src_pad.add_probe(self.Gst.PadProbeType.BUFFER, self._metadata_probe, None)
 
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
@@ -267,9 +265,12 @@ class DeepStreamPipeline:
         if result != self.Gst.PadLinkReturn.OK:
             log.error("Failed to link RTSP source pad to depayloader: %s", result)
 
-    def _add_sink_branch(self, osd) -> List[object]:
+    def _add_sink_branch(self) -> List[object]:
         sink_type = str(self.ds.get("sink_type", "fakesink")).lower()
         if not bool(self.ds.get("display", False)) and sink_type == "egl":
+            sink_type = "fakesink"
+        if sink_type == "appsink" and not bool(self.ds.get("enable_mjpeg_output", False)):
+            log.info("DeepStream appsink requested without MJPEG output; using fakesink.")
             sink_type = "fakesink"
 
         if sink_type == "fakesink":
@@ -278,18 +279,23 @@ class DeepStreamPipeline:
             self.pipeline.add(sink)
             return [sink]
 
+        nvvidconv = self._make("nvvideoconvert", "pre-osd-convert")
+        osd = self._make("nvdsosd", "onscreen-display")
+        self.pipeline.add(nvvidconv)
+        self.pipeline.add(osd)
+
         if sink_type == "egl":
             transform = self._make("nvegltransform", "egl-transform")
             sink = self._make("nveglglessink", "egl-sink")
             self._configure_sink(sink)
             self.pipeline.add(transform)
             self.pipeline.add(sink)
-            return [transform, sink]
+            return [nvvidconv, osd, transform, sink]
 
         if sink_type == "appsink":
             if len(self.cam_ids) > 1:
-                return self._add_demuxed_appsink_branch()
-            return self._add_single_appsink_branch()
+                return [nvvidconv, osd, *self._add_demuxed_appsink_branch()]
+            return [nvvidconv, osd, *self._add_single_appsink_branch()]
 
         raise DeepStreamConfigError(
             f"Unsupported DeepStream sink_type '{sink_type}'. Use fakesink, egl, or appsink."

@@ -73,17 +73,17 @@ chmod +x jetson_build_engines_from_onnx.sh
 ./jetson_build_engines_from_onnx.sh
 ```
 
-Expected FP32 outputs:
+Default FP32 outputs:
 
 ```text
-exports/yolo26n_fp32.engine
+.runtime/deepstream/yolov8n_b1_gpu0_fp32.engine
 exports/efficientnetb0_brand_fp32.engine
 ```
 
 After FP32 works, test FP16 explicitly:
 
 ```bash
-USE_FP16=1 YOLO_ENGINE=exports/yolo26n_fp16.engine BRAND_ENGINE=exports/efficientnetb0_brand_fp16.engine ./jetson_build_engines_from_onnx.sh
+USE_FP16=1 ./jetson_build_engines_from_onnx.sh
 ```
 
 The runtime supports these brand classifier formats:

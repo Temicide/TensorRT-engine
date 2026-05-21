@@ -35,6 +35,14 @@ def deepstream_config() -> Dict[str, object]:
     ds.setdefault("codec", "h264")
     ds.setdefault("sink_type", "fakesink")
     ds.setdefault("enable_mjpeg_output", False)
+    if not ds.get("engine_path"):
+        precision = {0: "fp32", 1: "int8", 2: "fp16"}.get(int(ds["network_mode"]), "fp32")
+        model_stem = Path(str(ds.get("onnx_model_path") or "model")).stem
+        model_stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in model_stem)
+        ds["engine_path"] = (
+            f".runtime/deepstream/{model_stem}_b{int(ds['batch_size'])}_"
+            f"gpu{int(ds['gpu_id'])}_{precision}.engine"
+        )
     return ds
 
 
@@ -124,7 +132,9 @@ def _config_lines(ds: Dict[str, object]) -> Iterable[str]:
     yield "[property]"
     yield f"gpu-id={int(ds['gpu_id'])}"
     yield f"onnx-file={resolve_project_path(str(ds['onnx_model_path']))}"
-    yield f"model-engine-file={resolve_project_path(str(ds['engine_path']))}"
+    engine_path = str(ds.get("engine_path") or "").strip()
+    if engine_path:
+        yield f"model-engine-file={resolve_project_path(engine_path)}"
     yield f"labelfile-path={resolve_project_path(str(ds['labels_path']))}"
     yield f"batch-size={int(ds['batch_size'])}"
     yield f"network-mode={int(ds['network_mode'])}"
@@ -154,7 +164,9 @@ def _config_lines(ds: Dict[str, object]) -> Iterable[str]:
 
 
 def write_primary_gie_config(ds: Dict[str, object]) -> str:
-    engine_path = Path(resolve_project_path(str(ds.get("engine_path") or "")))
-    engine_path.parent.mkdir(parents=True, exist_ok=True)
+    engine_path_value = str(ds.get("engine_path") or "").strip()
+    if engine_path_value:
+        engine_path = Path(resolve_project_path(engine_path_value))
+        engine_path.parent.mkdir(parents=True, exist_ok=True)
     RUNTIME_GIE_CONFIG.write_text("\n".join(_config_lines(ds)) + "\n", encoding="utf-8")
     return str(RUNTIME_GIE_CONFIG)

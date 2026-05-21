@@ -8,15 +8,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-YOLO_ONNX="${YOLO_ONNX:-${PROJECT_ROOT}/models/pipeline_beta/yolov8n(1).onnx}"
-YOLO_ENGINE="${YOLO_ENGINE:-${PROJECT_ROOT}/model_b5_gpu0_fp32.engine}"
-BRAND_ONNX="${BRAND_ONNX:-${SCRIPT_DIR}/exports/efficientnetb0_brand_opset12.onnx}"
-BRAND_ENGINE="${BRAND_ENGINE:-${SCRIPT_DIR}/exports/efficientnetb0_brand_fp32.engine}"
-YOLO_BATCH="${YOLO_BATCH:-5}"
+YOLO_BATCH="${YOLO_BATCH:-1}"
 YOLO_IMGSZ="${YOLO_IMGSZ:-640}"
 BRAND_IMGSZ="${BRAND_IMGSZ:-224}"
 WORKSPACE_MB="${WORKSPACE_MB:-1024}"
 USE_FP16="${USE_FP16:-0}"
+TRT_PRECISION="fp32"
+if [ "${USE_FP16}" = "1" ]; then
+  TRT_PRECISION="fp16"
+fi
+
+YOLO_ONNX="${YOLO_ONNX:-${PROJECT_ROOT}/models/pipeline_beta/yolov8n(1).onnx}"
+YOLO_ENGINE="${YOLO_ENGINE:-${PROJECT_ROOT}/.runtime/deepstream/yolov8n_b${YOLO_BATCH}_gpu0_${TRT_PRECISION}.engine}"
+BRAND_ONNX="${BRAND_ONNX:-${SCRIPT_DIR}/exports/efficientnetb0_brand_opset12.onnx}"
+BRAND_ENGINE="${BRAND_ENGINE:-${SCRIPT_DIR}/exports/efficientnetb0_brand_${TRT_PRECISION}.engine}"
 
 TRT_PRECISION_ARGS=()
 if [ "${USE_FP16}" = "1" ]; then

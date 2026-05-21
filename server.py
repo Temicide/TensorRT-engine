@@ -16,13 +16,14 @@ Endpoints:
 Start from editing config.py.
 """
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import uvicorn
 
 from config import CONFIG
-from core.pipeline import start_pipelines
+from core.pipeline import start_pipelines, stop_pipelines
 from core.state import cam_ids
 from routers.cameras import router as cameras_router
 from routers.detections import router as detections_router
@@ -32,7 +33,19 @@ from routers.logs import router as logs_router
 log = logging.getLogger("multicam")
 
 # ─────────────────────────── FastAPI ──────────────────────────────────────────
-app = FastAPI(title="Multi-Cam YOLO DeepStream", version="3.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    log.info("Starting DeepStream camera pipeline...")
+    start_pipelines()
+    try:
+        yield
+    finally:
+        log.info("Stopping DeepStream camera pipeline...")
+        stop_pipelines()
+
+
+app = FastAPI(title="Multi-Cam YOLO DeepStream", version="3.0", lifespan=lifespan)
 
 app.include_router(cameras_router)
 app.include_router(logs_router)
@@ -58,8 +71,5 @@ def root():
 # ─────────────────────────── Startup ──────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info("Starting DeepStream camera pipeline...")
-    start_pipelines()
-
     log.info(f"Starting FastAPI server on {CONFIG['host']}:{CONFIG['port']}")
     uvicorn.run(app, host=CONFIG["host"], port=CONFIG["port"], log_level="warning")

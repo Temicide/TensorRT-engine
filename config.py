@@ -45,9 +45,10 @@ CONFIG = {
 
         # Must be a raw YOLO detector export. Do not use an ONNX with NMS,
         # TopK, or Mod post-processing baked into the graph.
-        # Use the prebuilt FP16 engine (must have been generated on this exact Nano).
+        # Keep runtime engines out of git. nvinfer will create this file on the
+        # Jetson Nano the first time it starts, then reuse it on later runs.
         "onnx_model_path": "models/pipeline_beta/yolov8n(1).onnx",
-        "engine_path": "models/pipeline_beta/yolov8n_fp16.engine",
+        "engine_path": ".runtime/deepstream/yolov8n_b1_gpu0_fp16.engine",
         "labels_path": "configs/deepstream/labels_coco.txt",
         "custom_parser_path": "/opt/nvidia/deepstream/deepstream-6.0/sources/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so",
         "primary_gie_config_path": "configs/deepstream/primary_gie_yolov8n_nano.txt",
@@ -75,11 +76,12 @@ CONFIG = {
         "enable_tracker": False,
         "tracker_config_path": "configs/deepstream/tracker_nano_config.txt",
 
-        # Sink options: fakesink, egl, appsink. appsink preserves the existing
-        # MJPEG endpoint but copies frames to CPU and costs Nano CPU time.
+        # Sink options: fakesink, egl, appsink. Use fakesink for production
+        # metadata/API mode. appsink preserves the MJPEG endpoint but copies
+        # frames to CPU and costs Nano CPU time.
         "display": False,
-        "sink_type": "appsink",
-        "enable_mjpeg_output": True,
+        "sink_type": "fakesink",
+        "enable_mjpeg_output": False,
         "jpeg_quality": 70,
     },
 }
