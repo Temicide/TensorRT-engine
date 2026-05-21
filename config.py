@@ -23,7 +23,7 @@ CONFIG = {
     "gpu_required":   True,
 
     # Cameras to start. Keep deepstream.batch_size equal to this count.
-    "active_cameras": ["cam1", "cam2", "cam3", "cam4", "cam5"],
+    "active_cameras": ["cam1"],
 
     "cameras": {
         "cam1": "rtsp://10.0.11.153:8554/mock1",
@@ -53,7 +53,7 @@ CONFIG = {
         "primary_gie_config_path": "configs/deepstream/primary_gie_yolov8n_nano.txt",
 
         "network_mode": 2,  # 0=FP32, 1=INT8, 2=FP16
-        "batch_size": 5,
+        "batch_size": 1,
         "gpu_id": 0,
         "num_detected_classes": 80,
         "input_width": 640,
