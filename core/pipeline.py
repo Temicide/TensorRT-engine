@@ -11,6 +11,8 @@ from config import CONFIG
 from core.camera_capture import capture_loop
 from core.sse import broadcast_sse
 from core.state import cam_ids, cam_state, detection_log, detection_log_lock, latest_frame_state, MAX_LOG
+from core.tracker import DeepSORTTracker
+from core.reid import MobileNetv2ReID
 from routers.api_exporter import push_external_async
 from utils.utils import draw_frame
 
@@ -56,6 +58,25 @@ def inference_worker(model):
         hasattr(model, attr)
         for attr in ("engine", "infer_batch", "infer_raw", "decode_output")
     )
+
+    tracker_cfg = CONFIG.get("tracker", {})
+    tracker_enabled = tracker_cfg.get("enabled", True)
+    trackers = {}
+    reid_extractor = None
+    if tracker_enabled:
+        reid_model_path = tracker_cfg.get("reid_model_path")
+        reid_imgsz = tracker_cfg.get("reid_imgsz", 128)
+        reid_extractor = MobileNetv2ReID(model_path=reid_model_path, imgsz=reid_imgsz)
+        for cid in cam_ids:
+            trackers[cid] = DeepSORTTracker(
+                max_age=tracker_cfg.get("max_age", 30),
+                min_hits=tracker_cfg.get("min_hits", 3),
+                iou_threshold=tracker_cfg.get("iou_threshold", 0.3),
+                gating_threshold=tracker_cfg.get("gating_threshold", 9.4877),
+                gating_only_position=tracker_cfg.get("gating_only_position", False),
+                appearance_weight=tracker_cfg.get("appearance_weight", 0.5),
+            )
+        log.info("Tracker: DeepSORT enabled (per-camera), ReID=%s", "ONNX" if reid_model_path else "histogram")
 
     # Detect whether the engine supports batch > 1.
     # engine.max_batch_size is set at build time.
@@ -162,10 +183,66 @@ def inference_worker(model):
             times.append(time.time())
             fps = (len(times)-1) / (times[-1] - times[0]) if len(times) >= 2 else 0.0
 
+            if tracker_enabled and detections:
+                tracked = _run_tracker(trackers[cid], reid_extractor, frame, detections)
+                detections = tracked
+
             # Fire-and-forget: draw + JPEG encode + SSE push in background.
             postprocess_pool.submit(
                 _postprocess_one, cid, frame, detections, fps, fidx, per_frame_ms
             )
+
+
+def _run_tracker(tracker: DeepSORTTracker, reid: MobileNetv2ReID | None, frame: np.ndarray, detections: list[dict]) -> list[dict]:
+    bboxes = np.array([d["bbox_xyxy"] for d in detections], dtype=np.float32)
+    features = None
+    if reid is not None:
+        features = reid.extract(frame, bboxes)
+
+    track_results = tracker.update(bboxes, features)
+
+    id_map = {}
+    for t in track_results:
+        tid = int(t["track_id"])
+        id_map[tid] = {
+            "bbox": t["bbox"],
+            "hits": t["hits"],
+            "age": t["age"],
+        }
+
+    enriched = []
+    matched_tids = set()
+    for det in detections:
+        det_bbox = np.array(det["bbox_xyxy"], dtype=np.float32)
+        best_tid = None
+        best_iou = 0.0
+        for tid, info in id_map.items():
+            if tid in matched_tids:
+                continue
+            iou_val = _compute_iou(det_bbox, info["bbox"])
+            if iou_val > best_iou:
+                best_iou = iou_val
+                best_tid = tid
+        out = dict(det)
+        out["track_id"] = best_tid if best_tid is not None else -1
+        if best_tid is not None:
+            matched_tids.add(best_tid)
+        enriched.append(out)
+    return enriched
+
+
+def _compute_iou(a: np.ndarray, b: np.ndarray) -> float:
+    xx1 = max(a[0], b[0])
+    yy1 = max(a[1], b[1])
+    xx2 = min(a[2], b[2])
+    yy2 = min(a[3], b[3])
+    w = max(0.0, xx2 - xx1)
+    h = max(0.0, yy2 - yy1)
+    inter = w * h
+    area_a = max(0.0, (a[2] - a[0]) * (a[3] - a[1]))
+    area_b = max(0.0, (b[2] - b[0]) * (b[3] - b[1]))
+    union = area_a + area_b - inter
+    return inter / max(union, 1e-6)
 
 
 def _postprocess_one(cam_id, frame, detections, fps, frame_idx, latency_ms):

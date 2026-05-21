@@ -62,6 +62,18 @@ CONFIG = {
     # For debugging, set to ["cam1"] first. Use None to enable all cameras.
     "active_cameras": None,
 
+    "tracker": {
+        "enabled": True,
+        "max_age": 30,
+        "min_hits": 3,
+        "iou_threshold": 0.3,
+        "gating_threshold": 9.4877,
+        "gating_only_position": False,
+        "appearance_weight": 0.5,
+        "reid_model_path": None,
+        "reid_imgsz": 128,
+    },
+
     "cameras": {
         "cam1": "rtsp://10.0.11.153:8554/mock1",
         "cam2": "rtsp://10.0.11.153:8554/mock5",
