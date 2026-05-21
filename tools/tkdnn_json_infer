@@ -182,18 +182,41 @@ def nms(detections, iou_thresh):
     if not detections:
         return []
 
-    boxes = []
-    scores = []
-    for _, conf, bbox in detections:
-        x1, y1, x2, y2 = bbox
-        boxes.append([float(x1), float(y1), float(max(0.0, x2 - x1)), float(max(0.0, y2 - y1))])
-        scores.append(float(conf))
+    kept = []
+    classes = sorted({class_id for class_id, _, _ in detections})
 
-    indices = cv2.dnn.NMSBoxes(boxes, scores, 0.0, iou_thresh)
-    if len(indices) == 0:
-        return []
-    flat = np.array(indices).reshape(-1).tolist()
-    return [detections[i] for i in flat]
+    for class_id in classes:
+        class_detections = [d for d in detections if d[0] == class_id]
+        order = np.argsort([d[1] for d in class_detections])[::-1]
+
+        while len(order) > 0:
+            current = int(order[0])
+            kept.append(class_detections[current])
+            if len(order) == 1:
+                break
+
+            current_box = np.array(class_detections[current][2], dtype=np.float32)
+            remaining = [class_detections[int(i)] for i in order[1:]]
+            remaining_boxes = np.array([d[2] for d in remaining], dtype=np.float32)
+
+            xx1 = np.maximum(current_box[0], remaining_boxes[:, 0])
+            yy1 = np.maximum(current_box[1], remaining_boxes[:, 1])
+            xx2 = np.minimum(current_box[2], remaining_boxes[:, 2])
+            yy2 = np.minimum(current_box[3], remaining_boxes[:, 3])
+
+            inter_w = np.maximum(0.0, xx2 - xx1)
+            inter_h = np.maximum(0.0, yy2 - yy1)
+            intersection = inter_w * inter_h
+
+            current_area = max(0.0, current_box[2] - current_box[0]) * max(0.0, current_box[3] - current_box[1])
+            remaining_area = np.maximum(0.0, remaining_boxes[:, 2] - remaining_boxes[:, 0]) * np.maximum(
+                0.0, remaining_boxes[:, 3] - remaining_boxes[:, 1]
+            )
+            union = current_area + remaining_area - intersection
+            iou = intersection / np.maximum(union, 1e-6)
+            order = order[1:][iou <= iou_thresh]
+
+    return kept
 
 
 def main():
