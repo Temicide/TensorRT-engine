@@ -254,7 +254,7 @@ python3 tools/validate-deepstream-env.py
 python3 server.py
 ```
 
-The DeepStream pipeline starts from the FastAPI lifespan hook, so
+The DeepStream pipeline starts from FastAPI startup/shutdown hooks, so
 `uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1` also works. Keep
 workers at `1`; each worker process would otherwise create its own DeepStream
 pipeline.

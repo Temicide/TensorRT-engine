@@ -16,7 +16,6 @@ Endpoints:
 Start from editing config.py.
 """
 import logging
-from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -33,23 +32,23 @@ from routers.logs import router as logs_router
 log = logging.getLogger("multicam")
 
 # ─────────────────────────── FastAPI ──────────────────────────────────────────
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    log.info("Starting DeepStream camera pipeline...")
-    start_pipelines()
-    try:
-        yield
-    finally:
-        log.info("Stopping DeepStream camera pipeline...")
-        stop_pipelines()
-
-
-app = FastAPI(title="Multi-Cam YOLO DeepStream", version="3.0", lifespan=lifespan)
+app = FastAPI(title="Multi-Cam YOLO DeepStream", version="3.0")
 
 app.include_router(cameras_router)
 app.include_router(logs_router)
 app.include_router(detections_router)
+
+
+@app.on_event("startup")
+def startup_event():
+    log.info("Starting DeepStream camera pipeline...")
+    start_pipelines()
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    log.info("Stopping DeepStream camera pipeline...")
+    stop_pipelines()
 
 
 @app.get("/", response_class=HTMLResponse)
