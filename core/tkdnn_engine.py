@@ -1,5 +1,6 @@
 import json
 import logging
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -33,20 +34,24 @@ class TkDNNDarknetModel:
         self.rt = Path(self.config["rt"]) if self.config.get("rt") else None
         self.bridge_mode = self.config.get("bridge_mode", "image_command")
         self.command = self.config.get("command", "")
-        self.timeout_sec = float(self.config.get("timeout_sec", 2.0))
+        self.timeout_sec = float(self.config.get("timeout_sec", 15.0))
         self.imgsz = int(CONFIG.get("imgsz", 416))
+
+        if self.timeout_sec <= 0:
+            raise RuntimeError("CONFIG['tkdnn']['timeout_sec'] must be greater than 0")
 
         self._validate_darknet_assets()
         self._validate_rt_asset()
         self._validate_bridge()
 
         log.info(
-            "Loaded tkDNN/Darknet adapter: cfg=%s weights=%s names=%s rt=%s command=%s",
+            "Loaded tkDNN/Darknet adapter: cfg=%s weights=%s names=%s rt=%s command=%s timeout=%.1fs",
             self.cfg,
             self.weights,
             self.names,
             self.rt,
             self.command,
+            self.timeout_sec,
         )
 
     def _validate_darknet_assets(self):
@@ -135,14 +140,27 @@ class TkDNNDarknetModel:
                 "--iou",
                 str(CONFIG["iou_threshold"]),
             ])
-            completed = subprocess.run(
-                cmd,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                timeout=self.timeout_sec,
-            )
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    timeout=self.timeout_sec,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    "tkDNN bridge timed out after {:.1f}s. The bundled "
+                    "tkdnn_json_infer bridge cold-starts Python, PyCUDA, "
+                    "TensorRT, and the .rt engine for each call on Jetson. "
+                    "Increase CONFIG['tkdnn']['timeout_sec'] after timing one "
+                    "manual bridge run, or replace it with a persistent/native "
+                    "bridge for multi-camera use. Command: {}".format(
+                        self.timeout_sec,
+                        " ".join(shlex.quote(str(part)) for part in cmd),
+                    )
+                ) from None
 
         if completed.returncode != 0:
             raise RuntimeError(

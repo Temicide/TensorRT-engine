@@ -177,11 +177,30 @@ Then edit `config.py`:
 ```python
 "tkdnn": {
     "command": "/path/to/tkdnn_json_infer",
+    "timeout_sec": 15.0,
 }
 ```
 
 Keep the existing `cfg`, `weights`, and `names` paths unless you moved the
 model files.
+
+On Jetson Nano, time one manual bridge run before starting all cameras:
+
+```bash
+time /path/to/tkdnn_json_infer \
+  --rt /home/ta/tkDNN/build/yolo4tiny_fp16.rt \
+  --cfg models/pipeline_2/darknet/yolov4-tiny.cfg \
+  --weights models/pipeline_2/darknet/yolov4-tiny.weights \
+  --names models/pipeline_2/darknet/coco.names \
+  --image /path/to/test.jpg \
+  --conf 0.25 \
+  --iou 0.45
+```
+
+Set `CONFIG["tkdnn"]["timeout_sec"]` above that measured runtime. The bundled
+Python bridge cold-starts PyCUDA/TensorRT and loads the `.rt` file for each
+frame, so a 2 second timeout is usually too low on Nano. For real multi-camera
+FPS, replace it with a persistent/native bridge that keeps the engine loaded.
 
 ## 7. Configure Cameras
 
@@ -258,6 +277,11 @@ If startup says `CONFIG["tkdnn"]["command"]` is empty, tkDNN is not connected to
 the Python server yet. Build/provide the `tkdnn_json_infer` executable and set
 its path in `config.py`.
 
+If logs say `tkDNN bridge timed out after ...`, run the manual `time
+/path/to/tkdnn_json_infer ...` command above and raise
+`CONFIG["tkdnn"]["timeout_sec"]` above the measured runtime. Keep
+`"active_cameras": ["cam1"]` until a single camera returns detections.
+
 If RTSP capture is unstable, keep this in `config.py`:
 
 ```python
@@ -269,4 +293,3 @@ and start with one camera:
 ```python
 "active_cameras": ["cam1"]
 ```
-

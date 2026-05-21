@@ -41,7 +41,9 @@ CONFIG = {
         "rt": "/home/ta/tkDNN/build/yolo4tiny_fp16.rt",
         "bridge_mode": "image_command",
         "command": "/home/ta/hardteam_ws/tensorrt/chi_ws/tools/tkdnn_json_infer",
-        "timeout_sec": 2.0,
+        # The bundled Python bridge starts PyCUDA/TensorRT and loads the .rt file
+        # per call, which can exceed 2s on Jetson Nano even when inference works.
+        "timeout_sec": 15.0,
     },
 
     # Capture stability controls for Jetson Nano.
@@ -53,10 +55,10 @@ CONFIG = {
     "active_cameras": None,
 
     "cameras": {
-        "cam1": "rtsp://10.0.11.153:8554/mock1",
-        "cam2": "rtsp://10.0.11.153:8554/mock5",
-        "cam3": "rtsp://10.0.11.153:8554/mock9",
-        "cam4": "rtsp://10.0.11.153:8554/cctv08",
-        "cam5": "rtsp://10.0.11.153:8554/cctv09",
+        "cam1": "rtsp://172:16:30.8:8554/cctv0",
+        "cam2": "rtsp://172:16:30.8:8554/cctv1",
+        "cam3": "rtsp://172:16:30.8:8554/cctv2",
+        "cam4": "rtsp://172:16:30.8:8554/cctv3",
+        "cam5": "rtsp://172:16:30.8:8554/cctv4",
     },
 }

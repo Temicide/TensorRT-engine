@@ -120,6 +120,7 @@ The server is configured through `config.py`:
     "weights": "models/pipeline_2/darknet/yolov4-tiny.weights",
     "names": "models/pipeline_2/darknet/coco.names",
     "command": "/path/to/tkdnn_json_infer",
+    "timeout_sec": 15.0,
 }
 ```
 
@@ -144,6 +145,11 @@ Expected stdout:
 ```json
 [{"class_id":2,"class_name":"car","confidence":0.91,"bbox_xyxy":[10,20,120,220]}]
 ```
+
+Time the bridge manually on Jetson Nano before enabling all cameras. The
+bundled Python bridge starts PyCUDA/TensorRT and loads the `.rt` engine per
+call, so `timeout_sec` must be above the measured runtime. A persistent/native
+bridge is required for reasonable multi-camera FPS.
 
 Until that bridge exists, startup will fail with a clear configuration error.
 To return to the previous Python TensorRT engine workflow, set:

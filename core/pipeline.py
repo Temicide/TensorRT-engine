@@ -139,6 +139,9 @@ def inference_worker(model):
             for cid, frame in zip(ready_cids, ready_frames):
                 try:
                     dets = model.infer_frame(frame)
+                except RuntimeError as e:
+                    log.error("[%s] %s inference failed: %s", cid, backend_name, e)
+                    dets = []
                 except Exception as e:
                     log.exception("[%s] %s inference failed: %s", cid, backend_name, e)
                     dets = []
