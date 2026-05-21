@@ -76,7 +76,7 @@ def inference_worker(model):
             f"need {len(cam_ids)}). Rebuild engine with --maxShapes=images:{len(cam_ids)}x3x{imgsz}x{imgsz} for full GPU utilisation."
         )
     else:
-        log.info("Inference worker: PER-FRAME MODE backend=%s cameras=%s", backend_name, len(cam_ids))
+        log.info("Inference worker: PER-FRAME MODE backend=%s cameras=%s pool=%s", backend_name, len(cam_ids), getattr(model, "num_instances", 1))
     
     def preprocess(frame):
         """Resize + normalize a single BGR frame → float32 CHW."""
@@ -134,18 +134,21 @@ def inference_worker(model):
                         dets = []
                     batch_out.append(dets)
         else:
-            # Generic non-TensorRT backend, for example tkDNN through a bridge.
-            batch_out = []
-            for cid, frame in zip(ready_cids, ready_frames):
-                try:
-                    dets = model.infer_frame(frame)
-                except RuntimeError as e:
-                    log.error("[%s] %s inference failed: %s", cid, backend_name, e)
-                    dets = []
-                except Exception as e:
-                    log.exception("[%s] %s inference failed: %s", cid, backend_name, e)
-                    dets = []
-                batch_out.append(dets)
+            # Generic non-TensorRT backend (e.g. tkDNN through a bridge).
+            if hasattr(model, "infer_frames_parallel"):
+                batch_out = model.infer_frames_parallel(ready_cids, ready_frames)
+            else:
+                batch_out = []
+                for cid, frame in zip(ready_cids, ready_frames):
+                    try:
+                        dets = model.infer_frame(frame)
+                    except RuntimeError as e:
+                        log.error("[%s] %s inference failed: %s", cid, backend_name, e)
+                        dets = []
+                    except Exception as e:
+                        log.exception("[%s] %s inference failed: %s", cid, backend_name, e)
+                        dets = []
+                    batch_out.append(dets)
 
         t_infer_end = time.time()
         total_latency_ms = round((t_infer_end - t_infer_start) * 1000, 1)

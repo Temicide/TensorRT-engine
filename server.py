@@ -71,6 +71,10 @@ if __name__ == "__main__":
     log.info("Loading YOLO model backend: %s", CONFIG.get("inference_backend", "tensorrt_engine"))
     model = load_detector_model()
 
+    if hasattr(model, "warmup"):
+        log.info("Warming up tkDNN bridge pool (staggered TensorRT engine loading)...")
+        model.warmup()
+
     log.info("Starting camera pipeline threads...")
     start_pipelines(model)
 

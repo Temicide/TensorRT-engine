@@ -391,3 +391,97 @@ class TkDNNDarknetModel:
             "confidence": round(float(detection["confidence"]), 4),
             "bbox_xyxy": [round(float(value), 1) for value in bbox],
         }
+
+
+class TkDNNDarknetModelPool:
+    """Pool of persistent tkDNN bridge processes for parallel GPU inference.
+
+    Instead of one bridge process handling all cameras sequentially (which
+    leaves the GPU idle during CPU/I/O gaps between requests), this pool
+    runs N bridge processes concurrently.  Each camera is assigned a
+    dedicated bridge instance so that multiple TensorRT engines submit
+    work to the GPU at the same time, keeping utilisation high.
+
+    Each bridge instance internally keeps its own persistent subprocess
+    (started lazily on first inference).  Warm-up is staggered so that
+    the Jetson Nano does not try to create N CUDA contexts at once.
+    """
+
+    backend_name = "tkdnn_darknet_pool"
+    supports_batch = False
+
+    def __init__(self, tkdnn_config, num_instances):
+        self.config = dict(tkdnn_config or {})
+        self.num_instances = int(num_instances)
+        if self.num_instances < 1:
+            raise RuntimeError("num_bridge_instances must be >= 1, got {}".format(self.num_instances))
+
+        self.instances = [TkDNNDarknetModel(tkdnn_config) for _ in range(self.num_instances)]
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.num_instances, thread_name_prefix="tkdnn-infer",
+        )
+        atexit.register(self.close)
+
+        log.info(
+            "tkDNN bridge pool created: %d instance(s) for parallel inference",
+            self.num_instances,
+        )
+
+    def warmup(self, stagger_sec=3.0):
+        """Start all persistent bridges one-by-one with a delay.
+
+        Sends a dummy (black) frame through each bridge to trigger TensorRT
+        engine loading.  Staggering avoids N simultaneous CUDA context
+        creations on Jetson Nano which can exhaust GPU memory.
+        """
+        import numpy as np
+        dummy = np.zeros(
+            (int(CONFIG.get("imgsz", 416)), int(CONFIG.get("imgsz", 416)), 3),
+            dtype=np.uint8,
+        )
+
+        for i, inst in enumerate(self.instances):
+            log.info("Warming up bridge instance %d/%d ...", i + 1, self.num_instances)
+            try:
+                inst.infer_frame(dummy)
+            except Exception as exc:
+                log.warning(
+                    "Bridge instance %d warmup failed (will retry on first real frame): %s",
+                    i + 1, exc,
+                )
+            if i < self.num_instances - 1:
+                time.sleep(stagger_sec)
+
+        log.info("All %d bridge instances warmed up.", self.num_instances)
+
+    def infer_frames_parallel(self, cam_ids, frames):
+        """Infer N frames in parallel across the bridge pool.
+
+        Returns a list of detection lists, one per frame, in the same order
+        as *cam_ids* / *frames*.
+        """
+        n = len(cam_ids)
+        if n == 0:
+            return []
+
+        results = [None] * n
+
+        def _infer_one(idx):
+            inst = self.instances[idx % self.num_instances]
+            try:
+                results[idx] = inst.infer_frame(frames[idx])
+            except RuntimeError as exc:
+                log.error("[%s] tkdnn_darknet_pool inference failed: %s", cam_ids[idx], exc)
+                results[idx] = []
+            except Exception as exc:
+                log.exception("[%s] tkdnn_darknet_pool inference failed: %s", cam_ids[idx], exc)
+                results[idx] = []
+
+        futures = [self._executor.submit(_infer_one, i) for i in range(n)]
+        concurrent.futures.wait(futures)
+        return results
+
+    def close(self):
+        for inst in self.instances:
+            inst.close()
+        self._executor.shutdown(wait=False)

@@ -1,6 +1,6 @@
 from config import CONFIG
 from core.tensorrt_engine import YOLOModel
-from core.tkdnn_engine import TkDNNDarknetModel
+from core.tkdnn_engine import TkDNNDarknetModel, TkDNNDarknetModelPool
 
 
 def load_detector_model():
@@ -10,7 +10,12 @@ def load_detector_model():
         return YOLOModel(CONFIG["model_path"])
 
     if backend == "tkdnn_darknet":
-        return TkDNNDarknetModel(CONFIG.get("tkdnn", {}))
+        tkdnn_config = CONFIG.get("tkdnn", {})
+        num_cameras = len(CONFIG.get("active_cameras") or CONFIG.get("cameras", {}))
+        num_instances = tkdnn_config.get("num_bridge_instances", num_cameras)
+        if num_instances < 1:
+            num_instances = 1
+        return TkDNNDarknetModelPool(tkdnn_config, num_instances)
 
     raise RuntimeError(
         "Unsupported inference_backend={!r}. Use 'tensorrt_engine' or "

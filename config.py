@@ -45,6 +45,10 @@ CONFIG = {
         # persistent_command keeps PyCUDA/TensorRT and the .rt file loaded.
         # The first request may still include one-time TensorRT startup cost.
         "timeout_sec": 60.0,
+        # Number of parallel bridge processes. Each runs its own TensorRT engine.
+        # More instances → higher GPU utilisation.  Default = number of cameras.
+        # Reduce to 2-3 on Jetson Nano if GPU memory is tight.
+        "num_bridge_instances": None,
     },
 
     # Capture stability controls for Jetson Nano.
