@@ -214,6 +214,7 @@ class DeepStreamPipeline:
         if bool(self.ds.get("rtsp_tcp", True)):
             # 4 is GST_RTSP_LOWER_TRANS_TCP. Avoid importing GstRtsp for DS 6.0.
             source.set_property("protocols", 4)
+        self._configure_decoder(decoder)
 
         for element in (source, depay, parser, decoder):
             self.pipeline.add(element)
@@ -238,6 +239,18 @@ class DeepStreamPipeline:
         self.source_id_to_cam_id[source_id] = cam_id
         self.rtsp_source_info[source.get_name()] = (cam_id, str(uri))
         log.info("[%s] DeepStream RTSP source configured: %s (source_id=%d)", cam_id, redact_uri(str(uri)), source_id)
+
+    def _set_if_supported(self, element, prop_name: str, value) -> bool:
+        if element.find_property(prop_name) is None:
+            return False
+        element.set_property(prop_name, value)
+        return True
+
+    def _configure_decoder(self, decoder) -> None:
+        extra_surfaces = int(self.ds.get("decoder_num_extra_surfaces", 0) or 0)
+        if extra_surfaces > 0:
+            self._set_if_supported(decoder, "num-extra-surfaces", extra_surfaces)
+        self._set_if_supported(decoder, "enable-max-performance", True)
 
     def _request_streammux_sink_pad(self, streammux, index: int):
         # Service Maker accepts the pad template. Older DS6 GStreamer bindings

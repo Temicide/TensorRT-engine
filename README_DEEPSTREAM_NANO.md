@@ -239,6 +239,10 @@ Edit `config.py`:
 - `deepstream.input_width` / `input_height`
 - `deepstream.batch_size`: must match `len(active_cameras)`.
 - `deepstream.workspace_size`
+- `deepstream.rtsp_latency_ms`: start around `1000` for H.264 RTSP stability on
+  Nano. Lower values reduce latency but can drop reference frames.
+- `deepstream.drop_on_latency`: keep false unless you explicitly prefer dropped
+  frames over decode continuity.
 - `deepstream.sink_type`: `fakesink`, `egl`, or `appsink`
 - `deepstream.enable_mjpeg_output`: only true with `sink_type="appsink"`
 - `deepstream.rtsp_preflight`: keep true while debugging source URLs. It sends a

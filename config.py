@@ -38,10 +38,14 @@ CONFIG = {
         # Do not assume Orin/Xavier/Ampere behavior or DeepStream 7+ plugins.
         "rtsp_uri": None,  # None means use CONFIG["cameras"][active camera].
         "codec": "h264",  # h264 or h265.
-        "rtsp_latency_ms": 200,
+        # Use a larger jitter buffer for H.264 RTSP on Nano. Too little latency,
+        # especially with drop-on-latency enabled, can drop reference frames and
+        # produce decoder warnings such as "reference in DPB was never decoded".
+        "rtsp_latency_ms": 1000,
         "rtsp_tcp": True,
-        "drop_on_latency": True,
+        "drop_on_latency": False,
         "reconnect_sec": 5,
+        "decoder_num_extra_surfaces": 4,
 
         # Must be a raw YOLO detector export. Do not use an ONNX with NMS,
         # TopK, or Mod post-processing baked into the graph.
