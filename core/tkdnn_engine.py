@@ -140,7 +140,7 @@ class TkDNNDarknetModel:
                 check=False,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                universal_newlines=True,
                 timeout=self.timeout_sec,
             )
 
