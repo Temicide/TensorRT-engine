@@ -76,7 +76,7 @@ chmod +x jetson_build_engines_from_onnx.sh
 Default FP32 outputs:
 
 ```text
-.runtime/deepstream/yolov8n_b1_gpu0_fp32.engine
+model_b1_gpu0_fp32.engine
 exports/efficientnetb0_brand_fp32.engine
 ```
 

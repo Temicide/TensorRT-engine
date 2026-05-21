@@ -19,7 +19,7 @@ if [ "${USE_FP16}" = "1" ]; then
 fi
 
 YOLO_ONNX="${YOLO_ONNX:-${PROJECT_ROOT}/models/pipeline_beta/yolov8n(1).onnx}"
-YOLO_ENGINE="${YOLO_ENGINE:-${PROJECT_ROOT}/.runtime/deepstream/yolov8n_b${YOLO_BATCH}_gpu0_${TRT_PRECISION}.engine}"
+YOLO_ENGINE="${YOLO_ENGINE:-${PROJECT_ROOT}/model_b${YOLO_BATCH}_gpu0_${TRT_PRECISION}.engine}"
 BRAND_ONNX="${BRAND_ONNX:-${SCRIPT_DIR}/exports/efficientnetb0_brand_opset12.onnx}"
 BRAND_ENGINE="${BRAND_ENGINE:-${SCRIPT_DIR}/exports/efficientnetb0_brand_${TRT_PRECISION}.engine}"
 

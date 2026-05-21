@@ -37,11 +37,8 @@ def deepstream_config() -> Dict[str, object]:
     ds.setdefault("enable_mjpeg_output", False)
     if not ds.get("engine_path"):
         precision = {0: "fp32", 1: "int8", 2: "fp16"}.get(int(ds["network_mode"]), "fp32")
-        model_stem = Path(str(ds.get("onnx_model_path") or "model")).stem
-        model_stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in model_stem)
         ds["engine_path"] = (
-            f".runtime/deepstream/{model_stem}_b{int(ds['batch_size'])}_"
-            f"gpu{int(ds['gpu_id'])}_{precision}.engine"
+            f"model_b{int(ds['batch_size'])}_gpu{int(ds['gpu_id'])}_{precision}.engine"
         )
     return ds
 

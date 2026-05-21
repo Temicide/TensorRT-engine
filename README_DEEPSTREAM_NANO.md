@@ -28,8 +28,8 @@ Use conservative Jetson Nano assumptions:
 - CUDA 10.2 on standard JetPack 4.6.x.
 - Batch size must match the active camera count. The checked-in config starts
   one active RTSP stream for debugging.
-- The checked-in runtime config uses FP16 (`network-mode=2`) with a generated
-  runtime engine path. If FP16 fails on your Nano stack, switch to FP32
+- The checked-in runtime config uses FP16 (`network-mode=2`) with the engine
+  filename produced by DeepStream-Yolo on DS6. If FP16 fails on your Nano stack, switch to FP32
   (`network-mode=0`) and remove the stale runtime engine.
 
 ## Current Vanilla Pipeline That Was Replaced
@@ -48,7 +48,7 @@ Configured in `config.py` under `CONFIG["deepstream"]`:
 
 ```text
 ONNX model:        models/pipeline_beta/yolov8n(1).onnx
-Engine output:     .runtime/deepstream/yolov8n_b1_gpu0_fp16.engine
+Engine output:     model_b1_gpu0_fp16.engine
 Labels:            configs/deepstream/labels_coco.txt
 YOLO parser .so:   /opt/nvidia/deepstream/deepstream-6.0/sources/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so
 Primary GIE ref:   configs/deepstream/primary_gie_yolov8n_nano.txt
@@ -189,10 +189,10 @@ engine-create-func-name=NvDsInferYoloCudaEngineGet
 
 ## Build Or Regenerate Engine On Nano
 
-Preferred: let `nvinfer` build the engine on first run under `.runtime/`.
+Preferred: let `nvinfer` build the engine on first run.
 
 ```bash
-rm -f .runtime/deepstream/yolov8n_b1_gpu0_fp16.engine
+rm -f model_b1_gpu0_fp16.engine
 python3 server.py
 ```
 
@@ -201,7 +201,7 @@ Alternative: build with `trtexec` on the same Nano:
 ```bash
 /usr/src/tensorrt/bin/trtexec \
   --onnx='models/pipeline_beta/yolov8n(1).onnx' \
-  --saveEngine=.runtime/deepstream/yolov8n_b1_gpu0_fp32.engine \
+  --saveEngine=model_b1_gpu0_fp32.engine \
   --workspace=1024 \
   --minShapes=images:1x3x640x640 \
   --optShapes=images:1x3x640x640 \
@@ -213,7 +213,7 @@ Only after FP32 works, test FP16:
 ```bash
 /usr/src/tensorrt/bin/trtexec \
   --onnx='models/pipeline_beta/yolov8n(1).onnx' \
-  --saveEngine=.runtime/deepstream/yolov8n_b1_gpu0_fp16.engine \
+  --saveEngine=model_b1_gpu0_fp16.engine \
   --fp16 \
   --workspace=1024 \
   --minShapes=images:1x3x640x640 \
@@ -297,7 +297,7 @@ CPU and JPEG-encodes them.
   `/tmp/tensorrt_engine_primary_gie_yolov8n_nano.txt` using values from
   `config.py`.
 - Checked-in `.engine` files should not be assumed valid for Nano unless they
-  were built on this exact Nano environment. Runtime engines are written under
-  `.runtime/`, which is ignored by git.
+  were built on this exact Nano environment. Runtime engines match
+  `model_b*_gpu*_*.engine`, and `*.engine` is ignored by git.
 - The separate `models/pipeline_1/vehicle_metadata_pipeline.py` script remains a
   legacy/demo workflow. The server path now consumes DeepStream metadata.

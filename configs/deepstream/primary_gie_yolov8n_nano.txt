@@ -12,7 +12,7 @@
 [property]
 gpu-id=0
 onnx-file=models/pipeline_beta/yolov8n(1).onnx
-model-engine-file=.runtime/deepstream/yolov8n_b1_gpu0_fp16.engine
+model-engine-file=model_b1_gpu0_fp16.engine
 labelfile-path=configs/deepstream/labels_coco.txt
 batch-size=1
 network-mode=2
