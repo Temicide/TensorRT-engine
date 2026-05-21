@@ -19,6 +19,9 @@ from core.deepstream_config import (
     validate_deepstream_inputs,
     write_primary_gie_config,
 )
+import cv2
+import numpy as np
+
 from core.sse import broadcast_sse
 from core.state import MAX_LOG, cam_state, detection_log, detection_log_lock
 from routers.api_exporter import push_external_async
@@ -577,9 +580,6 @@ class DeepStreamPipeline:
             return self.Gst.FlowReturn.OK
 
         try:
-            import cv2
-            import numpy as np
-
             frame_rgba = np.ndarray(
                 shape=(height, width, 4),
                 dtype=np.uint8,
