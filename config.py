@@ -49,7 +49,7 @@ CONFIG = {
 
     # Capture stability controls for Jetson Nano.
     # If GStreamer probing crashes or fails, keep this False and use OpenCV/FFmpeg TCP.
-    "enable_gstreamer": False,
+    "enable_gstreamer": True,
     # Start capture threads one by one, not all at the same millisecond.
     "capture_startup_stagger_sec": 1.5,
     # For debugging, set to ["cam1"] first. Use None to enable all cameras.
