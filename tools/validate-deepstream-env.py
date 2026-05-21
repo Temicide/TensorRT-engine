@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate the Jetson Nano DeepStream runtime configuration without starting RTSP."""
+"""Validate the Jetson Nano DeepStream runtime configuration without starting the pipeline."""
 
 import shutil
 import subprocess
@@ -14,9 +14,14 @@ if str(PROJECT_ROOT) not in sys.path:
 from core.deepstream_config import (  # noqa: E402
     _config_lines,
     _detect_onnx_postprocess_ops,
+    active_camera_ids,
     deepstream_config,
     load_labels,
+    preflight_rtsp_sources,
+    redact_uri,
+    rtsp_source_uris,
     resolve_project_path,
+    validate_rtsp_sources,
 )
 
 
@@ -49,7 +54,24 @@ def check_gst_element(name: str) -> Tuple[bool, str]:
 
 def main() -> int:
     ds = deepstream_config()
+    camera_ids = active_camera_ids()
     checks: List[Tuple[bool, str]] = []
+
+    try:
+        validate_rtsp_sources(ds, camera_ids)
+        sources = ", ".join(
+            f"{cam_id}={redact_uri(uri)}" for cam_id, uri in rtsp_source_uris(ds, camera_ids)
+        )
+        checks.append((True, f"OK RTSP URI syntax: {sources}"))
+    except Exception as exc:
+        checks.append((False, f"FAIL RTSP URI syntax: {exc}"))
+
+    if bool(ds.get("rtsp_preflight", True)):
+        try:
+            preflight_rtsp_sources(ds, camera_ids)
+            checks.append((True, "OK RTSP preflight: sources answered RTSP"))
+        except Exception as exc:
+            checks.append((False, f"FAIL RTSP preflight: {exc}"))
 
     checks.append(check_file("ONNX model", str(ds.get("onnx_model_path") or "")))
     checks.append(check_file("labels file", str(ds.get("labels_path") or "")))

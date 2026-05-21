@@ -12,7 +12,10 @@ from core.deepstream_config import (
     active_camera_ids,
     deepstream_config,
     load_labels,
+    preflight_rtsp_sources,
+    redact_uri,
     resolve_project_path,
+    validate_rtsp_sources,
     validate_deepstream_inputs,
     write_primary_gie_config,
 )
@@ -63,6 +66,7 @@ class DeepStreamPipeline:
         self.labels = load_labels(str(self.ds["labels_path"]))
         self.gie_config_path = ""
         self.source_id_to_cam_id: Dict[int, str] = {}
+        self.rtsp_source_info: Dict[str, Tuple[str, str]] = {}
         self.fps_times = {
             cid: collections.deque(maxlen=30)
             for cid in self.cam_ids
@@ -88,6 +92,9 @@ class DeepStreamPipeline:
                 "For Jetson Nano, start with one active camera and batch_size=1."
             )
 
+        validate_rtsp_sources(self.ds, self.cam_ids)
+        if bool(self.ds.get("rtsp_preflight", True)):
+            preflight_rtsp_sources(self.ds, self.cam_ids)
         validate_deepstream_inputs(self.ds)
         self.gie_config_path = write_primary_gie_config(self.ds)
         self.GLib, self.Gst, self.pyds = _load_deepstream_modules()
@@ -229,7 +236,8 @@ class DeepStreamPipeline:
             raise DeepStreamConfigError(f"Failed to link decoder -> streammux for {cam_id}")
 
         self.source_id_to_cam_id[source_id] = cam_id
-        log.info("[%s] DeepStream RTSP source configured: %s (source_id=%d)", cam_id, uri, source_id)
+        self.rtsp_source_info[source.get_name()] = (cam_id, str(uri))
+        log.info("[%s] DeepStream RTSP source configured: %s (source_id=%d)", cam_id, redact_uri(str(uri)), source_id)
 
     def _request_streammux_sink_pad(self, streammux, index: int):
         # Service Maker accepts the pad template. Older DS6 GStreamer bindings
@@ -580,14 +588,44 @@ class DeepStreamPipeline:
         msg_type = message.type
         if msg_type == self.Gst.MessageType.ERROR:
             err, debug = message.parse_error()
-            log.error("DeepStream pipeline error: %s | debug=%s", err, debug)
+            source_name, source_context = self._bus_source_context(message)
+            log.error(
+                "DeepStream pipeline error from %s%s: %s | debug=%s",
+                source_name,
+                source_context,
+                err,
+                debug,
+            )
+            if self._is_rtsp_parse_error(err, debug):
+                log.error(
+                    "RTSP parse error means the endpoint did not return a valid RTSP response. "
+                    "Check that the camera URI points to an RTSP service, not an HTTP/FastAPI port."
+                )
             self._schedule_restart()
         elif msg_type == self.Gst.MessageType.EOS:
             log.warning("DeepStream pipeline reached EOS")
             self._schedule_restart()
         elif msg_type == self.Gst.MessageType.WARNING:
             warn, debug = message.parse_warning()
-            log.warning("DeepStream pipeline warning: %s | debug=%s", warn, debug)
+            source_name, source_context = self._bus_source_context(message)
+            log.warning(
+                "DeepStream pipeline warning from %s%s: %s | debug=%s",
+                source_name,
+                source_context,
+                warn,
+                debug,
+            )
+
+    def _bus_source_context(self, message) -> Tuple[str, str]:
+        source_name = message.src.get_name() if message.src is not None else "unknown"
+        if source_name in self.rtsp_source_info:
+            cam_id, uri = self.rtsp_source_info[source_name]
+            return source_name, f" [{cam_id} {redact_uri(uri)}]"
+        return source_name, ""
+
+    def _is_rtsp_parse_error(self, err, debug) -> bool:
+        text = f"{err} {debug}".lower()
+        return "gstrtspsrc" in text and "parse error" in text
 
     def _schedule_restart(self) -> None:
         if self.stopping:

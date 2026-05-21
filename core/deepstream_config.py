@@ -1,6 +1,8 @@
 import os
+import socket
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from config import CONFIG
 
@@ -48,6 +50,102 @@ def active_camera_ids() -> List[str]:
     if configured:
         return list(configured)
     return list(CONFIG["cameras"].keys())
+
+
+def rtsp_source_uris(ds: Dict[str, object], camera_ids: Iterable[str]) -> List[Tuple[str, str]]:
+    override_uri = str(ds.get("rtsp_uri") or "").strip()
+    cameras = CONFIG.get("cameras", {})
+    sources: List[Tuple[str, str]] = []
+    for cam_id in camera_ids:
+        if override_uri:
+            uri = override_uri
+        else:
+            if cam_id not in cameras:
+                raise DeepStreamConfigError(f"No RTSP URI configured for active camera '{cam_id}'.")
+            uri = str(cameras[cam_id]).strip()
+        sources.append((cam_id, uri))
+    return sources
+
+
+def redact_uri(uri: str) -> str:
+    parsed = urlsplit(uri)
+    if "@" not in parsed.netloc:
+        return uri
+    host_part = parsed.netloc.rsplit("@", 1)[1]
+    return urlunsplit((parsed.scheme, "***:***@" + host_part, parsed.path, parsed.query, parsed.fragment))
+
+
+def validate_rtsp_sources(ds: Dict[str, object], camera_ids: Iterable[str]) -> None:
+    problems: List[str] = []
+    for cam_id, uri in rtsp_source_uris(ds, camera_ids):
+        try:
+            parsed = urlsplit(uri)
+            _ = parsed.port
+        except ValueError as exc:
+            problems.append(f"{cam_id}: invalid RTSP URI {redact_uri(uri)} ({exc})")
+            continue
+
+        if parsed.scheme.lower() != "rtsp":
+            problems.append(f"{cam_id}: URI must start with rtsp://, got {redact_uri(uri)}")
+        if not parsed.hostname:
+            problems.append(f"{cam_id}: RTSP URI is missing a hostname: {redact_uri(uri)}")
+
+    if problems:
+        raise DeepStreamConfigError("Invalid RTSP source configuration:\n  - " + "\n  - ".join(problems))
+
+
+def _probe_rtsp_uri(uri: str, timeout_sec: float) -> Tuple[bool, str]:
+    parsed = urlsplit(uri)
+    host = parsed.hostname
+    if not host:
+        return False, "missing hostname"
+    port = parsed.port or 554
+
+    request = (
+        f"OPTIONS {uri} RTSP/1.0\r\n"
+        "CSeq: 1\r\n"
+        "User-Agent: tensorrt-engine-deepstream-preflight\r\n"
+        "\r\n"
+    )
+    try:
+        with socket.create_connection((host, port), timeout=timeout_sec) as sock:
+            sock.settimeout(timeout_sec)
+            sock.sendall(request.encode("utf-8"))
+            response = sock.recv(4096)
+    except socket.timeout:
+        return False, "timed out before receiving an RTSP response"
+    except OSError as exc:
+        return False, str(exc)
+
+    if not response:
+        return False, "connection closed without an RTSP response"
+
+    first_line = response.splitlines()[0].decode("latin-1", errors="replace").strip()
+    if first_line.startswith("RTSP/"):
+        return True, first_line
+    return (
+        False,
+        f"server answered {first_line!r}, not RTSP/1.0. "
+        "This usually means the URI points to HTTP, the wrong port, or a non-RTSP mock endpoint.",
+    )
+
+
+def preflight_rtsp_sources(ds: Dict[str, object], camera_ids: Iterable[str]) -> None:
+    timeout_sec = float(ds.get("rtsp_preflight_timeout_sec", 3))
+    failures: List[str] = []
+    for cam_id, uri in rtsp_source_uris(ds, camera_ids):
+        ok, detail = _probe_rtsp_uri(uri, timeout_sec)
+        if not ok:
+            failures.append(f"{cam_id} {redact_uri(uri)}: {detail}")
+
+    if failures:
+        raise DeepStreamConfigError(
+            "RTSP preflight failed before starting DeepStream:\n"
+            "  - "
+            + "\n  - ".join(failures)
+            + "\nUse a real RTSP URL/port, or set deepstream.rtsp_preflight=False "
+            "temporarily if the camera rejects OPTIONS probes."
+        )
 
 
 def resolve_project_path(path_value: Optional[str]) -> str:

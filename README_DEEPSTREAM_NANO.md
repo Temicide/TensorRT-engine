@@ -241,6 +241,9 @@ Edit `config.py`:
 - `deepstream.workspace_size`
 - `deepstream.sink_type`: `fakesink`, `egl`, or `appsink`
 - `deepstream.enable_mjpeg_output`: only true with `sink_type="appsink"`
+- `deepstream.rtsp_preflight`: keep true while debugging source URLs. It sends a
+  lightweight RTSP `OPTIONS` request before DeepStream starts, so wrong
+  HTTP/FastAPI ports fail fast instead of looping inside `rtspsrc`.
 
 Run:
 
@@ -289,6 +292,11 @@ CPU and JPEG-encodes them.
 - Memory usage is acceptable on Nano.
 - Pipeline restarts after RTSP errors or EOS.
 - If tracker is enabled, `track_id` appears and remains stable enough for the use case.
+
+If the log shows `Could not receive message. (Parse error)` from `gstrtspsrc`,
+the endpoint did not return a valid RTSP response. Check that the URL is a real
+RTSP service and not an HTTP endpoint on the same host. The first response line
+from the source should start with `RTSP/1.0`, not `HTTP/1.1`.
 
 ## Notes
 

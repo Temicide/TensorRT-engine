@@ -42,6 +42,10 @@ CONFIG = {
         "rtsp_tcp": True,
         "drop_on_latency": True,
         "reconnect_sec": 5,
+        # Catch wrong ports/HTTP endpoints before DeepStream loads TensorRT.
+        # Set false only if a real camera rejects RTSP OPTIONS probes.
+        "rtsp_preflight": True,
+        "rtsp_preflight_timeout_sec": 3,
 
         # Must be a raw YOLO detector export. Do not use an ONNX with NMS,
         # TopK, or Mod post-processing baked into the graph.
