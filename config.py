@@ -26,11 +26,11 @@ CONFIG = {
     "active_cameras": ["cam1"],
 
     "cameras": {
-        "cam1": "rtsp://10.0.11.153:8000/mock1",
-        "cam2": "rtsp://10.0.11.153:8000/mock5",
-        "cam3": "rtsp://10.0.11.153:8000/mock9",
-        "cam4": "rtsp://10.0.11.153:8000/cctv08",
-        "cam5": "rtsp://10.0.11.153:8000/cctv09",
+        "cam1": "rtsp://10.0.11.153:8554/mock1",
+        "cam2": "rtsp://10.0.11.153:8554/mock5",
+        "cam3": "rtsp://10.0.11.153:8554/mock9",
+        "cam4": "rtsp://10.0.11.153:8554/cctv08",
+        "cam5": "rtsp://10.0.11.153:8554/cctv09",
     },
 
     "deepstream": {
@@ -42,10 +42,6 @@ CONFIG = {
         "rtsp_tcp": True,
         "drop_on_latency": True,
         "reconnect_sec": 5,
-        # Catch wrong ports/HTTP endpoints before DeepStream loads TensorRT.
-        # Set false only if a real camera rejects RTSP OPTIONS probes.
-        "rtsp_preflight": True,
-        "rtsp_preflight_timeout_sec": 3,
 
         # Must be a raw YOLO detector export. Do not use an ONNX with NMS,
         # TopK, or Mod post-processing baked into the graph.
