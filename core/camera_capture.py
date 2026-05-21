@@ -12,6 +12,38 @@ log = logging.getLogger("multicam")
 # ─────────────────────────── Pipeline loop per camera ─────────────────────────
 CAPTURE_OPEN_LOCK = threading.Lock()
 
+def _gst_rtsp_candidates(source):
+    """Return RTSP GStreamer pipelines from fastest/specific to broadest."""
+    appsink = "appsink drop=true sync=false max-buffers=1"
+    src = f"rtspsrc location={source} protocols=tcp latency=200 drop-on-latency=true"
+
+    return [
+        (
+            "h264-nvv4l2decoder",
+            f"{src} ! rtph264depay ! h264parse ! nvv4l2decoder ! nvvidconv ! "
+            f"video/x-raw,format=BGRx ! videoconvert ! video/x-raw,format=BGR ! {appsink}",
+        ),
+        (
+            "h265-nvv4l2decoder",
+            f"{src} ! rtph265depay ! h265parse ! nvv4l2decoder ! nvvidconv ! "
+            f"video/x-raw,format=BGRx ! videoconvert ! video/x-raw,format=BGR ! {appsink}",
+        ),
+        (
+            "h264-omx",
+            f"{src} ! rtph264depay ! h264parse ! omxh264dec ! nvvidconv ! "
+            f"video/x-raw,format=BGRx ! videoconvert ! video/x-raw,format=BGR ! {appsink}",
+        ),
+        (
+            "h265-omx",
+            f"{src} ! rtph265depay ! h265parse ! omxh265dec ! nvvidconv ! "
+            f"video/x-raw,format=BGRx ! videoconvert ! video/x-raw,format=BGR ! {appsink}",
+        ),
+        (
+            "decodebin",
+            f"{src} ! decodebin ! videoconvert ! video/x-raw,format=BGR ! {appsink}",
+        ),
+    ]
+
 def open_capture(cam_id, source):
     """Open RTSP capture safely on Jetson Nano.
 
@@ -20,31 +52,16 @@ def open_capture(cam_id, source):
     """
     with CAPTURE_OPEN_LOCK:
         if source.startswith("rtsp://") and CONFIG.get("enable_gstreamer", False):
-            gst_candidates = [
-                (
-                    f"rtspsrc location={source} protocols=tcp latency=200 drop-on-latency=true ! "
-                    "rtph264depay ! h264parse ! nvv4l2decoder ! nvvidconv ! "
-                    "video/x-raw,format=BGRx ! videoconvert ! "
-                    "video/x-raw,format=BGR ! appsink drop=1 sync=false max-buffers=1"
-                ),
-                (
-                    f"rtspsrc location={source} protocols=tcp latency=200 drop-on-latency=true ! "
-                    "rtph264depay ! h264parse ! omxh264dec ! nvvidconv ! "
-                    "video/x-raw,format=BGRx ! videoconvert ! "
-                    "video/x-raw,format=BGR ! appsink drop=1 sync=false max-buffers=1"
-                ),
-                (
-                    f"rtspsrc location={source} protocols=tcp latency=200 drop-on-latency=true ! "
-                    "rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! "
-                    "video/x-raw,format=BGR ! appsink drop=1 sync=false max-buffers=1"
-                ),
-            ]
-
-            for gst in gst_candidates:
+            for name, gst in _gst_rtsp_candidates(source):
                 cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
                 if cap.isOpened():
-                    log.info(f"[{cam_id}] GStreamer capture OK")
+                    log.info(f"[{cam_id}] GStreamer capture OK using {name}")
                     return cap
+                log.warning(f"[{cam_id}] GStreamer candidate failed: {name}")
+
+            if CONFIG.get("require_gstreamer", False):
+                log.error(f"[{cam_id}] GStreamer capture failed and require_gstreamer=True")
+                return cv2.VideoCapture()
 
             log.warning(f"[{cam_id}] GStreamer capture failed, falling back to OpenCV/FFmpeg")
 

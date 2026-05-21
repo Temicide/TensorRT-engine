@@ -298,3 +298,10 @@ and start with one camera:
 ```python
 "active_cameras": ["cam1"]
 ```
+
+To force RTSP capture through GStreamer only, use:
+
+```python
+"enable_gstreamer": True,
+"require_gstreamer": True
+```
