@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "skills": {
+    "deepstream-dev": {
+      "source": "NVIDIA-AI-IOT/DeepStream_Coding_Agent",
+      "sourceType": "github",
+      "skillPath": "skills/deepstream-dev/SKILL.md",
+      "computedHash": "81daa6e611804331c9f00a0963d0c7b6e8ca54f5adac0ae9cd04f84ee54c24df"
+    },
+    "deepstream-import-vision-model": {
+      "source": "NVIDIA-AI-IOT/DeepStream_Coding_Agent",
+      "sourceType": "github",
+      "skillPath": "skills/deepstream-import-vision-model/SKILL.md",
+      "computedHash": "664481913fdada992b0d2fb28fa376eca95c847faa208caa3fcb17283b26eeb4"
+    }
+  }
+}

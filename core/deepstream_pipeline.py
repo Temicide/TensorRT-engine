@@ -73,6 +73,7 @@ class DeepStreamPipeline:
         self.mainloop = None
         self.loop_thread: Optional[threading.Thread] = None
         self.stopping = False
+        self.restart_pending = False
         self.GLib = None
         self.Gst = None
         self.pyds = None
@@ -219,17 +220,28 @@ class DeepStreamPipeline:
 
         source.connect("pad-added", self._on_rtsp_pad_added, depay)
 
-        sinkpad = streammux.get_request_pad(f"sink_{index}")
+        sinkpad = streammux.get_request_pad("sink_%u")
         if sinkpad is None:
-            raise DeepStreamConfigError(f"Could not request streammux sink_{index}")
+            raise DeepStreamConfigError(f"Could not request streammux sink pad for {cam_id}")
+        source_id = self._streammux_source_id(sinkpad, index)
         srcpad = decoder.get_static_pad("src")
         if srcpad is None:
             raise DeepStreamConfigError(f"Could not get decoder src pad for {cam_id}")
         if srcpad.link(sinkpad) != Gst.PadLinkReturn.OK:
             raise DeepStreamConfigError(f"Failed to link decoder -> streammux for {cam_id}")
 
-        self.source_id_to_cam_id[index] = cam_id
-        log.info("[%s] DeepStream RTSP source configured: %s", cam_id, uri)
+        self.source_id_to_cam_id[source_id] = cam_id
+        log.info("[%s] DeepStream RTSP source configured: %s (source_id=%d)", cam_id, uri, source_id)
+
+    def _streammux_source_id(self, sinkpad, fallback_index: int) -> int:
+        pad_name = sinkpad.get_name() or ""
+        if pad_name.startswith("sink_"):
+            try:
+                return int(pad_name.rsplit("_", 1)[1])
+            except ValueError:
+                pass
+        log.warning("Could not parse streammux pad name '%s'; using source index %d", pad_name, fallback_index)
+        return fallback_index
 
     def _on_rtsp_pad_added(self, source, pad, depay) -> None:
         sinkpad = depay.get_static_pad("sink")
@@ -253,14 +265,14 @@ class DeepStreamPipeline:
 
         if sink_type == "fakesink":
             sink = self._make("fakesink", "sink")
-            sink.set_property("sync", False)
+            self._configure_sink(sink)
             self.pipeline.add(sink)
             return [sink]
 
         if sink_type == "egl":
             transform = self._make("nvegltransform", "egl-transform")
             sink = self._make("nveglglessink", "egl-sink")
-            sink.set_property("sync", False)
+            self._configure_sink(sink)
             self.pipeline.add(transform)
             self.pipeline.add(sink)
             return [transform, sink]
@@ -321,11 +333,16 @@ class DeepStreamPipeline:
         caps = self.Gst.Caps.from_string("video/x-raw,format=RGBA")
         capsfilter.set_property("caps", caps)
         appsink.set_property("emit-signals", True)
-        appsink.set_property("sync", False)
+        self._configure_sink(appsink)
         appsink.set_property("drop", True)
         appsink.set_property("max-buffers", 1)
         appsink.connect("new-sample", self._on_new_sample, cam_id)
         return convert, capsfilter, appsink
+
+    def _configure_sink(self, sink) -> None:
+        sink.set_property("sync", False)
+        sink.set_property("async", False)
+        sink.set_property("qos", False)
 
     def _request_demux_src_pad(self, demux, index: int, cam_id: str):
         for pad_name in (f"src_{index}", "src_%u"):
@@ -560,6 +577,9 @@ class DeepStreamPipeline:
     def _schedule_restart(self) -> None:
         if self.stopping:
             return
+        if self.restart_pending:
+            return
+        self.restart_pending = True
         try:
             self.pipeline.set_state(self.Gst.State.NULL)
         except Exception:
@@ -571,11 +591,13 @@ class DeepStreamPipeline:
 
     def _restart_pipeline(self):
         if self.stopping:
+            self.restart_pending = False
             return False
         ret = self.pipeline.set_state(self.Gst.State.PLAYING)
         if ret == self.Gst.StateChangeReturn.FAILURE:
             log.error("DeepStream pipeline restart failed; will retry")
             self.GLib.timeout_add_seconds(int(self.ds.get("reconnect_sec", 5)), self._restart_pipeline)
         else:
+            self.restart_pending = False
             log.info("DeepStream pipeline restart requested")
         return False
