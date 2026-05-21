@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Multi-Camera YOLO TensorRT Jetson Pipeline - safe capture
-5 RTSP streams -> TensorRT YOLO engine -> per-camera MJPEG + SSE + log
+Multi-Camera YOLO Jetson Pipeline - safe capture
+5 RTSP streams -> detector backend -> per-camera MJPEG + SSE + log
 All detection logs POST to: http://10.0.11.153:8080/api/v1/raw_data
 
 Endpoints:
@@ -17,7 +17,7 @@ Start from editing config.py
 """
 import os
 import logging
-from core.tensorrt_engine import YOLOModel
+from core.model_factory import load_detector_model
 from config import CONFIG
 from core.pipeline import start_pipelines
 from routers.cameras import router as cameras_router
@@ -42,7 +42,7 @@ import uvicorn
 log = logging.getLogger("multicam")
 
 # ─────────────────────────── FastAPI ──────────────────────────────────────────
-app = FastAPI(title="Multi-Cam YOLO TensorRT", version="2.0")
+app = FastAPI(title="Multi-Cam YOLO Jetson", version="2.1")
 
 app.include_router(cameras_router)
 app.include_router(logs_router)
@@ -55,7 +55,8 @@ def root():
         for i in range(1, 6)
     )
     return HTMLResponse(f"""<html><body style="background:#111;color:#eee;font-family:monospace;padding:24px;">
-<h2 style="color:#0f0">Multi-Cam YOLO TensorRT Server</h2>
+<h2 style="color:#0f0">Multi-Cam YOLO Jetson Server</h2>
+<p>Backend: {CONFIG.get("inference_backend", "tensorrt_engine")}</p>
 <ul>{links}
 <li><a href="/log/live" style="color:#f80">/log/live</a> — Central log (all cameras)</li>
 <li><a href="/detections">/detections</a> — JSON API</li>
@@ -66,8 +67,8 @@ def root():
 # ─────────────────────────── Startup ──────────────────────────────────────────
 
 if __name__ == "__main__":
-    log.info("Loading YOLO model...")
-    model = YOLOModel(CONFIG["model_path"])
+    log.info("Loading YOLO model backend: %s", CONFIG.get("inference_backend", "tensorrt_engine"))
+    model = load_detector_model()
 
     log.info("Starting camera pipeline threads...")
     start_pipelines(model)

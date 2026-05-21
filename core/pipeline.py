@@ -18,14 +18,15 @@ log = logging.getLogger("multicam")
 
 def inference_worker(model):
     """
-    Batched TensorRT inference worker.
+    Detector inference worker.
 
     Strategy:
       1. Every loop tick, collect the LATEST frame from each camera (skip if unchanged).
-      2. Preprocess all available frames on CPU in parallel (resize+normalize via numpy).
-      3. Stack into a single batch tensor and run ONE TensorRT call for all cameras.
+      2. For TensorRT models, preprocess available frames on CPU in parallel.
+      3. If supported, stack into a single batch tensor and run ONE TensorRT call.
          → GPU sees a larger workload per call → much higher utilisation.
-      4. Dispatch draw+JPEG+SSE for each result into a thread-pool so GPU loop never
+      4. For non-TensorRT backends, call model.infer_frame(frame) per camera.
+      5. Dispatch draw+JPEG+SSE for each result into a thread-pool so inference never
          waits for slow CPU work.
 
     Requires a TensorRT engine built with max_batch_size >= num_cameras.
@@ -49,23 +50,33 @@ def inference_worker(model):
     fps_times      = {cid: collections.deque(maxlen=30) for cid in cam_ids}
     last_processed = {cid: -1 for cid in cam_ids}
 
-    imgsz = model.imgsz
+    imgsz = getattr(model, "imgsz", int(CONFIG.get("imgsz", 416)))
+    backend_name = getattr(model, "backend_name", "tensorrt_engine")
+    has_tensorrt_api = all(
+        hasattr(model, attr)
+        for attr in ("engine", "infer_batch", "infer_raw", "decode_output")
+    )
 
     # Detect whether the engine supports batch > 1.
     # engine.max_batch_size is set at build time.
-    try:
-        engine_max_batch = int(model.engine.max_batch_size)
-    except Exception:
+    if has_tensorrt_api:
+        try:
+            engine_max_batch = int(model.engine.max_batch_size)
+        except Exception:
+            engine_max_batch = 1
+    else:
         engine_max_batch = 1
-    batch_capable = engine_max_batch >= len(cam_ids)
+    batch_capable = has_tensorrt_api and engine_max_batch >= len(cam_ids)
 
     if batch_capable:
         log.info(f"Inference worker: BATCH MODE (max_batch={engine_max_batch}, cameras={len(cam_ids)})")
-    else:
+    elif has_tensorrt_api:
         log.info(
             f"Inference worker: SEQUENTIAL fallback (engine max_batch={engine_max_batch}, "
             f"need {len(cam_ids)}). Rebuild engine with --maxShapes=images:{len(cam_ids)}x3x{imgsz}x{imgsz} for full GPU utilisation."
         )
+    else:
+        log.info("Inference worker: PER-FRAME MODE backend=%s cameras=%s", backend_name, len(cam_ids))
     
     def preprocess(frame):
         """Resize + normalize a single BGR frame → float32 CHW."""
@@ -94,31 +105,42 @@ def inference_worker(model):
 
         t_infer_start = time.time()
 
-        # ── 2. Preprocess all frames in parallel on CPU ───────────────────────
-        # Each frame is independent → use thread pool for speed on multi-core CPU.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(ready_cids)) as pp:
-            chw_list = list(pp.map(preprocess, ready_frames))
+        if has_tensorrt_api:
+            # ── 2. Preprocess all frames in parallel on CPU ───────────────────
+            # Each frame is independent → use thread pool for speed on multi-core CPU.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(ready_cids)) as pp:
+                chw_list = list(pp.map(preprocess, ready_frames))
 
-        # ── 3. TensorRT inference ─────────────────────────────────────────────
-        if batch_capable and len(ready_cids) > 1:
-            # Stack into [N, 3, H, W] and call GPU once.
-            batch_tensor = np.stack(chw_list, axis=0)   # [N, C, H, W]
-            try:
-                orig_shapes = [f.shape[:2] for f in ready_frames]
-                batch_out = model.infer_batch(batch_tensor, orig_shapes)
-            except Exception as e:
-                log.exception(f"Batch TensorRT inference failed: {e}")
-                batch_out = [[] for _ in ready_cids]
-        else:
-            # Sequential batch=1 calls (fallback or single frame).
-            batch_out = []
-            for cid, chw in zip(ready_cids, chw_list):
-                inp = chw[np.newaxis]   # [1, C, H, W]
+            # ── 3. TensorRT inference ─────────────────────────────────────────
+            if batch_capable and len(ready_cids) > 1:
+                # Stack into [N, 3, H, W] and call GPU once.
+                batch_tensor = np.stack(chw_list, axis=0)   # [N, C, H, W]
                 try:
-                    outs = model.infer_raw(inp)
-                    dets = model.decode_output(outs[0], ready_frames[ready_cids.index(cid)].shape[:2])
+                    orig_shapes = [f.shape[:2] for f in ready_frames]
+                    batch_out = model.infer_batch(batch_tensor, orig_shapes)
                 except Exception as e:
-                    log.exception(f"[{cid}] TensorRT inference failed: {e}")
+                    log.exception(f"Batch TensorRT inference failed: {e}")
+                    batch_out = [[] for _ in ready_cids]
+            else:
+                # Sequential batch=1 calls (fallback or single frame).
+                batch_out = []
+                for cid, chw in zip(ready_cids, chw_list):
+                    inp = chw[np.newaxis]   # [1, C, H, W]
+                    try:
+                        outs = model.infer_raw(inp)
+                        dets = model.decode_output(outs[0], ready_frames[ready_cids.index(cid)].shape[:2])
+                    except Exception as e:
+                        log.exception(f"[{cid}] TensorRT inference failed: {e}")
+                        dets = []
+                    batch_out.append(dets)
+        else:
+            # Generic non-TensorRT backend, for example tkDNN through a bridge.
+            batch_out = []
+            for cid, frame in zip(ready_cids, ready_frames):
+                try:
+                    dets = model.infer_frame(frame)
+                except Exception as e:
+                    log.exception("[%s] %s inference failed: %s", cid, backend_name, e)
                     dets = []
                 batch_out.append(dets)
 
@@ -189,12 +211,12 @@ def start_pipelines(model):
         log.info(f"Started capture thread: {cam_id}")
         time.sleep(float(CONFIG.get("capture_startup_stagger_sec", 0.0)))
 
-    # Start exactly one TensorRT inference thread. CUDA/TensorRT is used only here.
+    # Start exactly one inference thread. GPU runtimes are used only here.
     t = threading.Thread(
         target=inference_worker,
         args=(model,),
         daemon=True,
-        name="tensorrt-inference-worker",
+        name="detector-inference-worker",
     )
     t.start()
-    log.info("Started TensorRT inference worker")
+    log.info("Started detector inference worker")

@@ -1,5 +1,10 @@
 # ─────────────────────────── CONFIG (edit only here) ──────────────────────────
 CONFIG = {
+    # Inference backend:
+    #   "tensorrt_engine" -> existing Python TensorRT .engine runtime.
+    #   "tkdnn_darknet"   -> tkDNN/Darknet bridge using models/pipeline_2/darknet.
+    "inference_backend": "tkdnn_darknet",
+
     # TensorRT engine built for this exact Jetson / TensorRT / CUDA version.
     # Example: /usr/src/tensorrt/bin/trtexec --onnx=yolov8n.onnx --saveEngine=yolov8n.engine --fp16
     "model_path":     "yolov8n.engine",
@@ -15,6 +20,28 @@ CONFIG = {
 
     # TensorRT engine inference is GPU-only. If TensorRT/PyCUDA cannot load, startup stops.
     "gpu_required":   True,
+
+    # tkDNN/Darknet detector configuration.
+    #
+    # tkDNN does not run ONNX directly. It uses Darknet cfg/weights during its
+    # export/build workflow, then runs a tkDNN/TensorRT runtime. The Python
+    # server needs a small executable bridge for per-frame inference.
+    #
+    # Expected bridge contract for "image_command" mode:
+    #   <command> --cfg <cfg> --weights <weights> --names <names>
+    #             --image <jpg> --conf <float> --iou <float>
+    # It must print JSON to stdout:
+    #   [{"class_id":2,"class_name":"car","confidence":0.91,
+    #     "bbox_xyxy":[10,20,120,220]}]
+    "tkdnn": {
+        "darknet_dir": "models/pipeline_2/darknet",
+        "cfg": "models/pipeline_2/darknet/yolov4-tiny.cfg",
+        "weights": "models/pipeline_2/darknet/yolov4-tiny.weights",
+        "names": "models/pipeline_2/darknet/coco.names",
+        "bridge_mode": "image_command",
+        "command": "",
+        "timeout_sec": 2.0,
+    },
 
     # Capture stability controls for Jetson Nano.
     # If GStreamer probing crashes or fails, keep this False and use OpenCV/FFmpeg TCP.
