@@ -52,7 +52,7 @@ CONFIG = {
         # DeepStream-Yolo on DS6 serializes engines as model_b<batch>_gpu<id>_<precision>.engine
         # in the working directory. Keep the nvinfer model-engine-file pointed at
         # that path so restarts reuse the file instead of rebuilding.
-        "onnx_model_path": "models/pipeline_beta/yolov8n_214_Fixed.onnx",
+        "onnx_model_path": "models/pipeline_beta/yolov8n(1).onnx",
         "engine_path": "model_b1_gpu0_fp16.engine",
         "labels_path": "configs/deepstream/labels_coco.txt",
         "custom_parser_path": "/opt/nvidia/deepstream/deepstream-6.0/sources/DeepStream-Yolo/nvdsinfer_custom_impl_Yolo/libnvdsinfer_custom_impl_Yolo.so",
