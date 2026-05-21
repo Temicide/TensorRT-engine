@@ -62,8 +62,8 @@ CONFIG = {
         "batch_size": 1,
         "gpu_id": 0,
         "num_detected_classes": 80,
-        "input_width": 640,
-        "input_height": 640,
+        "input_width": 320,
+        "input_height": 320,
         "output_blob_names": "output0",
         "confidence_threshold": 0.25,
         "iou_threshold": 0.45,
@@ -75,7 +75,7 @@ CONFIG = {
         # handles model input resizing with aspect-ratio padding.
         "mux_width": 960,
         "mux_height": 544,
-        "batched_push_timeout_us": 10,
+        "batched_push_timeout_us": -1,
 
         # Optional tracker. Keep disabled until detection metadata is validated.
         "enable_tracker": False,
